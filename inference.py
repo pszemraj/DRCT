@@ -34,7 +34,7 @@ def main():
         "--tile",
         type=int,
         default=256,
-        help="Tile size, -1 for no tile during testing (testing as a whole)",
+        help="Tile size, -1 for no tile during inference (infeerence on whole img)",
     )
     parser.add_argument(
         "--tile_overlap", type=int, default=32, help="Overlapping of different tiles"
@@ -65,7 +65,9 @@ def main():
         resi_connection="1conv",
     )
 
-    model.load_state_dict(torch.load(args.model_path)["params"], strict=True)
+    model.load_state_dict(
+        torch.load(args.model_path, weights_only=True)["params"], strict=True
+    )
     model.eval()
     model = model.to(device)
 
@@ -88,7 +90,7 @@ def main():
     )
     for idx, path in enumerate(tqdm(input_files, desc="inference")):
         imgname = os.path.splitext(os.path.basename(path))[0]
-        print("Testing", idx, imgname)
+        # print("Testing", idx, imgname)
         # read image
         img = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.0
         img = torch.from_numpy(np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))).float()
@@ -111,15 +113,15 @@ def main():
                 ]
                 output = test(img, model, args, window_size)
                 output = output[..., : h_old * args.scale, : w_old * args.scale]
+                output = output.data.squeeze().float().cpu().clamp_(0, 1).numpy()
 
         except Exception as error:
             print("Error", error, imgname)
         else:
             # save image
-            output = output.data.squeeze().float().cpu().clamp_(0, 1).numpy()
             output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))
             output = (output * 255.0).round().astype(np.uint8)
-            cv2.imwrite(os.path.join(args.output, f"{imgname}_DRCT-L_X4.png"), output)
+            cv2.imwrite(os.path.join(out_dir, f"{imgname}_DRCT-L_X4.png"), output)
 
 
 def test(img_lq, model, args, window_size):
