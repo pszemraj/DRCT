@@ -1,10 +1,9 @@
-import numpy as np
-import tempfile
-import shutil
 import os
-from PIL import Image
+import shutil
 import subprocess
+import tempfile
 from cog import BasePredictor, Input, Path
+from PIL import Image
 
 
 class Predictor(BasePredictor):

@@ -1,10 +1,9 @@
 import os
-from PIL import Image
-import torchvision
 import torch
+import torchvision
+from PIL import Image
 
-
-IMG_EXTENSIONS = ['jpg', 'jpeg', 'png', 'ppm', 'bmp', 'pgm']
+IMG_EXTENSIONS = ["jpg", "jpeg", "png", "ppm", "bmp", "pgm"]
 
 
 def mkdir(path):
@@ -12,14 +11,14 @@ def mkdir(path):
         os.makedirs(path)
 
 
-def pil_loader(path, mode='RGB'):
+def pil_loader(path, mode="RGB"):
     """
     open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
     :param path: image path
     :return: PIL.Image
     """
     assert _is_image_file(path), "%s is not an image" % path
-    with open(path, 'rb') as f:
+    with open(path, "rb") as f:
         with Image.open(f) as img:
             return img.convert(mode)
 
@@ -70,27 +69,29 @@ def getLayers(model):
     return layers
 
 
-def load_as_tensor(path, mode='RGB'):
+def load_as_tensor(path, mode="RGB"):
     """
     Load image to tensor
     :param path: image path
     :param mode: 'Y' returns 1 channel tensor, 'RGB' returns 3 channels, 'RGBA' returns 4 channels, 'YCbCr' returns 3 channels
     :return: 3D tensor
     """
-    if mode != 'Y':
+    if mode != "Y":
         return PIL2Tensor(pil_loader(path, mode=mode))
     else:
-        return PIL2Tensor(pil_loader(path, mode='YCbCr'))[:1]
+        return PIL2Tensor(pil_loader(path, mode="YCbCr"))[:1]
 
 
 def PIL2Tensor(pil_image):
     return torchvision.transforms.functional.to_tensor(pil_image)
 
 
-def Tensor2PIL(tensor_image, mode='RGB'):
+def Tensor2PIL(tensor_image, mode="RGB"):
     if len(tensor_image.size()) == 4 and tensor_image.size()[0] == 1:
         tensor_image = tensor_image.view(tensor_image.size()[1:])
-    return torchvision.transforms.functional.to_pil_image(tensor_image.detach(), mode=mode)
+    return torchvision.transforms.functional.to_pil_image(
+        tensor_image.detach(), mode=mode
+    )
 
 
 def _is_image_file(filename):
@@ -119,7 +120,7 @@ def image_files(path):
 
 def split_to_batches(l, n):
     for i in range(0, len(l), n):
-        yield l[i:i + n]
+        yield l[i : i + n]
 
 
 def _sigmoid_to_tanh(x):
@@ -128,7 +129,7 @@ def _sigmoid_to_tanh(x):
     :param x: tensor type
     :return: tensor
     """
-    return (x - 0.5) * 2.
+    return (x - 0.5) * 2.0
 
 
 def _tanh_to_sigmoid(x):
@@ -146,7 +147,7 @@ def _add_batch_one(tensor):
     :param tensor: 2D or 3D tensor
     :return: 3D or 4D tensor
     """
-    return tensor.view((1, ) + tensor.size())
+    return tensor.view((1,) + tensor.size())
 
 
 def _remove_batch(tensor):
@@ -157,7 +158,7 @@ def _remove_batch(tensor):
     """
     return tensor.view(tensor.size()[1:])
 
+
 def mod_crop(tensor, scale=4):
     B, C, H, W = tensor.shape
-    return tensor[:, :, :H-H % scale, :W-W % scale]
-
+    return tensor[:, :, : H - H % scale, : W - W % scale]

@@ -1,7 +1,8 @@
-from basicsr.utils.registry import ARCH_REGISTRY
 from torch import nn as nn
 from torch.nn import functional as F
 from torch.nn.utils import spectral_norm
+
+from basicsr.utils.registry import ARCH_REGISTRY
 
 
 @ARCH_REGISTRY.register()
@@ -43,17 +44,17 @@ class UNetDiscriminatorSN(nn.Module):
         x3 = F.leaky_relu(self.conv3(x2), negative_slope=0.2, inplace=True)
 
         # upsample
-        x3 = F.interpolate(x3, scale_factor=2, mode='bilinear', align_corners=False)
+        x3 = F.interpolate(x3, scale_factor=2, mode="bilinear", align_corners=False)
         x4 = F.leaky_relu(self.conv4(x3), negative_slope=0.2, inplace=True)
 
         if self.skip_connection:
             x4 = x4 + x2
-        x4 = F.interpolate(x4, scale_factor=2, mode='bilinear', align_corners=False)
+        x4 = F.interpolate(x4, scale_factor=2, mode="bilinear", align_corners=False)
         x5 = F.leaky_relu(self.conv5(x4), negative_slope=0.2, inplace=True)
 
         if self.skip_connection:
             x5 = x5 + x1
-        x5 = F.interpolate(x5, scale_factor=2, mode='bilinear', align_corners=False)
+        x5 = F.interpolate(x5, scale_factor=2, mode="bilinear", align_corners=False)
         x6 = F.leaky_relu(self.conv6(x5), negative_slope=0.2, inplace=True)
 
         if self.skip_connection:
