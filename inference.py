@@ -69,7 +69,7 @@ def main():
     model.eval()
     model = model.to(device)
 
-    print(model)
+    model = torch.compile(model)
 
     window_size = 16
 
