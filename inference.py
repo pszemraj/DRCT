@@ -1,47 +1,48 @@
 import argparse
-import cv2
 import glob
-import numpy as np
 import os
+
+import cv2
+import numpy as np
 import torch
-
 from drct.archs.DRCT_arch import *
+from tqdm.auto import tqdm
 
-# from drct.data import *
-# from drct.models import *
+# Define image file extensions
+image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.gif", "*.tiff", "*.webp")
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "input",
+        type=str,
+        help="input test image folder",
+    )
     parser.add_argument(
         "--model_path",
         type=str,
         # noqa: E251
         default="/work/u1657859/DRCT/experiments/train_DRCT-L_SRx4_finetune_from_ImageNet_pretrain/models/DRCT-L.pth",  # noqa: E501
     )
-    parser.add_argument(
-        "--input",
-        type=str,
-        default="datasets/Set14/LRbicx4",
-        help="input test image folder",
-    )
-    parser.add_argument(
-        "--output", type=str, default="results/DRCT-L", help="output folder"
-    )
+
+    parser.add_argument("--output", type=str, default=None, help="output folder")
     parser.add_argument("--scale", type=int, default=4, help="scale factor: 1, 2, 3, 4")
     # parser.add_argument('--window_size', type=int, default=16, help='16')
 
     parser.add_argument(
         "--tile",
         type=int,
-        default=None,
-        help="Tile size, None for no tile during testing (testing as a whole)",
+        default=256,
+        help="Tile size, -1 for no tile during testing (testing as a whole)",
     )
     parser.add_argument(
         "--tile_overlap", type=int, default=32, help="Overlapping of different tiles"
     )
 
     args = parser.parse_args()
+    if args.tile < 1:
+        args.tile = None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # set up model (DRCT-L)
@@ -72,8 +73,20 @@ def main():
 
     window_size = 16
 
-    os.makedirs(args.output, exist_ok=True)
-    for idx, path in enumerate(sorted(glob.glob(os.path.join(args.input, "*")))):
+    out_dir = (
+        args.output
+        if args.output is not None
+        else os.path.join(args.input, "DRCT-outputs")
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    input_files = sorted(
+        [
+            f
+            for ext in image_extensions
+            for f in glob.glob(os.path.join(args.input, ext))
+        ]
+    )
+    for idx, path in enumerate(tqdm(input_files, desc="inference")):
         imgname = os.path.splitext(os.path.basename(path))[0]
         print("Testing", idx, imgname)
         # read image
@@ -85,7 +98,7 @@ def main():
         # print(img.shape)
         # inference
         try:
-            with torch.no_grad():
+            with torch.inference_mode():
                 # output = model(img)
                 _, _, h_old, w_old = img.size()
                 h_pad = (h_old // window_size + 1) * window_size - h_old
