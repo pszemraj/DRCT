@@ -26,12 +26,25 @@ def get_sorted_files_by_size(input_path, image_extensions):
     Returns:
         list: List of file paths sorted by size (smallest to largest)
     """
-    # First collect all files matching the extensions
-    input_files = [
-        f for ext in image_extensions for f in glob.glob(os.path.join(input_path, ext))
+    # Create case-insensitive patterns by using both lowercase and uppercase versions
+    case_insensitive_patterns = [
+        f
+        for ext in image_extensions
+        for f in (
+            os.path.join(input_path, ext.lower()),
+            os.path.join(input_path, ext.upper()),
+        )
     ]
 
-    # Sort files by their size using os.path.getsize()
+    # Collect all files matching any of the patterns
+    input_files = []
+    for pattern in case_insensitive_patterns:
+        input_files.extend(glob.glob(pattern))
+
+    # Remove any duplicates that might have been found
+    input_files = list(dict.fromkeys(input_files))
+
+    # Sort files by their size
     input_files = sorted(input_files, key=lambda x: os.path.getsize(x))
 
     return input_files
