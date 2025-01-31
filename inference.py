@@ -13,6 +13,39 @@ from drct.archs.DRCT_arch import *
 image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.webp")
 
 
+def check_ampere_gpu():
+    """
+    Check if the GPU supports NVIDIA Ampere or later and enable FP32 in PyTorch if it does.
+    """
+    # Check if CUDA is available
+    if not torch.cuda.is_available():
+        print("No GPU detected, running on CPU.")
+        return
+
+    try:
+        # Get the compute capability of the GPU
+        device = torch.cuda.current_device()
+        capability = torch.cuda.get_device_capability(device)
+        major, minor = capability
+
+        # Check if the GPU is Ampere or newer (compute capability >= 8.0)
+        if major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+            gpu_name = torch.cuda.get_device_name(device)
+            print(
+                f"{gpu_name} (compute capability {major}.{minor}) supports NVIDIA Ampere or later, enabled TF32 in PyTorch."
+            )
+        else:
+            gpu_name = torch.cuda.get_device_name(device)
+            print(
+                f"{gpu_name} (compute capability {major}.{minor}) does not support NVIDIA Ampere or later."
+            )
+
+    except Exception as e:
+        print(f"Error occurred while checking GPU: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -82,7 +115,9 @@ def main():
     model.eval()
     model = model.to(device)
 
-    model = torch.compile(model)
+    if args.compile:
+        print("Compiling model...")
+        model = torch.compile(model)
 
     window_size = 16
 
@@ -101,17 +136,20 @@ def main():
     )
     for idx, path in enumerate(tqdm(input_files, desc="inference")):
         imgname = os.path.splitext(os.path.basename(path))[0]
-        # print("Testing", idx, imgname)
-        # read image
-        img = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.0
-        img = torch.from_numpy(np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))).float()
 
-        # img = torch.from_numpy(np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))).float()
-        img = img.unsqueeze(0).to(device)
-        # print(img.shape)
-        # inference
+        # read image
         try:
-            with torch.inference_mode(), torch.autocast("cuda", enabled=torch.cuda.is_available()):
+            img = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.0
+            img = torch.from_numpy(
+                np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))
+            ).float()
+
+            img = img.unsqueeze(0).to(device)
+
+            # inference
+            with torch.inference_mode(), torch.autocast(
+                "cuda", enabled=torch.cuda.is_available()
+            ):
                 # output = model(img)
                 _, _, h_old, w_old = img.size()
                 h_pad = (h_old // window_size + 1) * window_size - h_old
@@ -120,7 +158,7 @@ def main():
                     :, :, : h_old + h_pad, :
                 ]
                 img = torch.cat([img, torch.flip(img, [3])], 3)[
-            with torch.inference_mode(), torch.autocast("cuda", enabled=torch.cuda.is_available()):
+                    :, :, :, : w_old + w_pad
                 ]
                 output = test(img, model, args, window_size)
                 output = output[..., : h_old * args.scale, : w_old * args.scale]
@@ -146,12 +184,7 @@ def test(img_lq, model, args, window_size):
         output = model(img_lq)
     else:
         # test the image tile by tile
-            cv2.imwrite(
-                os.path.join(out_dir, f"{imgname}_DRCT-L_X{args.scale}.jpg"), output
-            )
-
-        if "cuda" in str(device):
-            torch.cuda.empty_cache()
+        b, c, h, w = img_lq.size()
         tile = min(args.tile, h, w)
         assert tile % window_size == 0, "tile size should be a multiple of window_size"
         tile_overlap = args.tile_overlap
