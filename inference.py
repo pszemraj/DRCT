@@ -67,6 +67,8 @@ def check_ampere_gpu():
                 f"{gpu_name} (compute capability {major}.{minor}) does not support NVIDIA Ampere or later."
             )
 
+        torch.backends.cudnn.benchmark = True
+
     except Exception as e:
         print(f"Error occurred while checking GPU: {e}")
 
@@ -144,7 +146,7 @@ def main():
 
     if args.compile:
         print("Compiling model...")
-        model = torch.compile(model)
+        model = torch.compile(model, mode="reduce-overhead")
 
     window_size = 16
 
@@ -166,11 +168,13 @@ def main():
 
         try:
             img = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.0
-            img = torch.from_numpy(
-                np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))
-            ).float()
+            img = (
+                torch.from_numpy(np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1)))
+                .float()
+                .pin_memory()
+            )
 
-            img = img.unsqueeze(0).to(device)
+            img = img.unsqueeze(0).to(device, non_blocking=True)
 
             # inference
             with (
@@ -198,9 +202,6 @@ def main():
             output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))
             output = (output * 255.0).round().astype(np.uint8)
             cv2.imwrite(out_path, output)
-
-        if "cuda" in str(device):
-            torch.cuda.empty_cache()
 
 
 def test(img_lq, model, args, window_size):
