@@ -10,7 +10,8 @@ from tqdm.auto import tqdm
 from drct.archs.DRCT_arch import *
 
 # Define image file extensions
-image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.gif", "*.tiff", "*.webp")
+image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.webp")
+
 
 
 def main():
