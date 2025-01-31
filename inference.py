@@ -13,6 +13,28 @@ from drct.archs.DRCT_arch import *
 image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.webp")
 
 
+def get_sorted_files_by_size(input_path, image_extensions):
+    """
+    Get a list of files sorted by file size (ascending).
+
+    Args:
+        input_path (str): Path to the directory containing images
+        image_extensions (list): List of image extensions to look for (e.g., ['*.jpg', '*.png'])
+
+    Returns:
+        list: List of file paths sorted by size (smallest to largest)
+    """
+    # First collect all files matching the extensions
+    input_files = [
+        f for ext in image_extensions for f in glob.glob(os.path.join(input_path, ext))
+    ]
+
+    # Sort files by their size using os.path.getsize()
+    input_files = sorted(input_files, key=lambda x: os.path.getsize(x))
+
+    return input_files
+
+
 def check_ampere_gpu():
     """
     Check if the GPU supports NVIDIA Ampere or later and enable FP32 in PyTorch if it does.
@@ -76,7 +98,7 @@ def main():
         help="Tile size, -1 for no tile during inference (inference on whole img)",
     )
     parser.add_argument(
-        "--tile_overlap", type=int, default=32, help="Overlapping of different tiles"
+        "--tile_overlap", type=int, default=16, help="Overlapping of different tiles"
     )
     parser.add_argument(("--compile"), action="store_true", help="use torch.compile")
 
@@ -127,17 +149,11 @@ def main():
         else os.path.join(args.input, "upscaled-DRCT-outputs")
     )
     os.makedirs(out_dir, exist_ok=True)
-    input_files = sorted(
-        [
-            f
-            for ext in image_extensions
-            for f in glob.glob(os.path.join(args.input, ext))
-        ]
-    )
-    for idx, path in enumerate(tqdm(input_files, desc="inference")):
+
+    input_files = get_sorted_files_by_size(args.input, image_extensions)
+    for path in tqdm(input_files, desc="inference"):
         imgname = os.path.splitext(os.path.basename(path))[0]
 
-        # read image
         try:
             img = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.0
             img = torch.from_numpy(
@@ -147,8 +163,9 @@ def main():
             img = img.unsqueeze(0).to(device)
 
             # inference
-            with torch.inference_mode(), torch.autocast(
-                "cuda", enabled=torch.cuda.is_available()
+            with (
+                torch.inference_mode(),
+                torch.autocast("cuda", enabled=torch.cuda.is_available()),
             ):
                 # output = model(img)
                 _, _, h_old, w_old = img.size()
