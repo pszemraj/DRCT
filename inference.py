@@ -1,20 +1,11 @@
 import argparse
 import cv2
-import cv2
 import glob
-import json
-import os
-
-import cv2
 import json
 import numpy as np
 import os
-import os
 import torch
-from drct.archs.DRCT_arch import *
 from tqdm.auto import tqdm
-
-from drct.archs.DRCT_arch import *
 
 from drct.archs.DRCT_arch import *
 
@@ -97,7 +88,7 @@ def main():
     out_dir = (
         args.output
         if args.output is not None
-        else os.path.join(args.input, "DRCT-outputs")
+        else os.path.join(args.input, "upscaled-DRCT-outputs")
     )
     os.makedirs(out_dir, exist_ok=True)
     input_files = sorted(
@@ -119,7 +110,7 @@ def main():
         # print(img.shape)
         # inference
         try:
-            with torch.inference_mode():
+            with torch.inference_mode(), torch.autocast("cuda", enabled=torch.cuda.is_available()):
                 # output = model(img)
                 _, _, h_old, w_old = img.size()
                 h_pad = (h_old // window_size + 1) * window_size - h_old
@@ -128,7 +119,7 @@ def main():
                     :, :, : h_old + h_pad, :
                 ]
                 img = torch.cat([img, torch.flip(img, [3])], 3)[
-                    :, :, :, : w_old + w_pad
+            with torch.inference_mode(), torch.autocast("cuda", enabled=torch.cuda.is_available()):
                 ]
                 output = test(img, model, args, window_size)
                 output = output[..., : h_old * args.scale, : w_old * args.scale]
@@ -140,7 +131,12 @@ def main():
             # save image
             output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))
             output = (output * 255.0).round().astype(np.uint8)
-            cv2.imwrite(os.path.join(out_dir, f"{imgname}_DRCT-L_X4.png"), output)
+            cv2.imwrite(
+                os.path.join(out_dir, f"{imgname}_DRCT-L_X{args.scale}.jpg"), output
+            )
+
+        if "cuda" in str(device):
+            torch.cuda.empty_cache()
 
 
 def test(img_lq, model, args, window_size):
@@ -149,7 +145,12 @@ def test(img_lq, model, args, window_size):
         output = model(img_lq)
     else:
         # test the image tile by tile
-        b, c, h, w = img_lq.size()
+            cv2.imwrite(
+                os.path.join(out_dir, f"{imgname}_DRCT-L_X{args.scale}.jpg"), output
+            )
+
+        if "cuda" in str(device):
+            torch.cuda.empty_cache()
         tile = min(args.tile, h, w)
         assert tile % window_size == 0, "tile size should be a multiple of window_size"
         tile_overlap = args.tile_overlap
