@@ -117,6 +117,10 @@ def main():
     parser.add_argument(
         "--tile_overlap", type=int, default=16, help="Overlapping of different tiles"
     )
+    parser.add_argument(
+        "--jpeg_quality", type=int, default=90, help="JPEG quality (0-100)"
+    )
+
     parser.add_argument("--compile", action="store_true", help="use torch.compile")
     parser.add_argument(
         "-skip", "--skip_completed", action="store_true", help="skip completed images"
@@ -214,7 +218,9 @@ def main():
             # save image
             output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))
             output = (output * 255.0).round().astype(np.uint8)
-            cv2.imwrite(out_path, output)
+            cv2.imwrite(
+                str(out_path), output, [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality]
+            )
 
 
 def test(img_lq, model, args, window_size):
