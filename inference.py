@@ -1,29 +1,43 @@
 import argparse
+import cv2
+import cv2
 import glob
+import json
 import os
 
 import cv2
+import json
 import numpy as np
+import os
+import os
 import torch
 from drct.archs.DRCT_arch import *
 from tqdm.auto import tqdm
+
+from drct.archs.DRCT_arch import *
+
+from drct.archs.DRCT_arch import *
 
 # Define image file extensions
 image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.gif", "*.tiff", "*.webp")
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="DRCT Inference",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "input",
         type=str,
         help="input test image folder",
     )
     parser.add_argument(
+        "-m",
         "--model_path",
         type=str,
         # noqa: E251
-        default="/work/u1657859/DRCT/experiments/train_DRCT-L_SRx4_finetune_from_ImageNet_pretrain/models/DRCT-L.pth",  # noqa: E501
+        default="experiments/pretrained_models/DRCT-L_X4.pth",  # noqa: E501
     )
 
     parser.add_argument("--output", type=str, default=None, help="output folder")
@@ -34,15 +48,20 @@ def main():
         "--tile",
         type=int,
         default=256,
-        help="Tile size, -1 for no tile during inference (infeerence on whole img)",
+        help="Tile size, -1 for no tile during inference (inference on whole img)",
     )
     parser.add_argument(
         "--tile_overlap", type=int, default=32, help="Overlapping of different tiles"
     )
+    parser.add_argument(("--compile"), action="store_true", help="use torch.compile")
 
     args = parser.parse_args()
+    print(f"Running inference with args:\n{json.dumps(args.__dict__, indent=4)}")
+
     if args.tile < 1:
         args.tile = None
+
+    check_ampere_gpu()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # set up model (DRCT-L)
