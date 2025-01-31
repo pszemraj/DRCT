@@ -1,9 +1,11 @@
 import argparse
-import cv2
 import glob
 import json
-import numpy as np
 import os
+from pathlib import Path
+
+import cv2
+import numpy as np
 import torch
 from tqdm.auto import tqdm
 
@@ -100,7 +102,10 @@ def main():
     parser.add_argument(
         "--tile_overlap", type=int, default=16, help="Overlapping of different tiles"
     )
-    parser.add_argument(("--compile"), action="store_true", help="use torch.compile")
+    parser.add_argument("--compile", action="store_true", help="use torch.compile")
+    parser.add_argument(
+        "-skip", "--skip_completed", action="store_true", help="skip completed images"
+    )
 
     args = parser.parse_args()
     print(f"Running inference with args:\n{json.dumps(args.__dict__, indent=4)}")
@@ -144,15 +149,20 @@ def main():
     window_size = 16
 
     out_dir = (
-        args.output
+        Path(args.output)
         if args.output is not None
-        else os.path.join(args.input, "upscaled-DRCT-outputs")
+        else Path(args.input) / "upscaled-DRCT-outputs"
     )
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     input_files = get_sorted_files_by_size(args.input, image_extensions)
     for path in tqdm(input_files, desc="inference"):
         imgname = os.path.splitext(os.path.basename(path))[0]
+        out_path = out_dir / f"{imgname}_DRCT-L_X{args.scale}.jpg"
+
+        if args.skip_completed and out_path.exists():
+            print(f"Skipping completed image: {out_path.name}")
+            continue
 
         try:
             img = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.0
@@ -187,9 +197,7 @@ def main():
             # save image
             output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))
             output = (output * 255.0).round().astype(np.uint8)
-            cv2.imwrite(
-                os.path.join(out_dir, f"{imgname}_DRCT-L_X{args.scale}.jpg"), output
-            )
+            cv2.imwrite(out_path, output)
 
         if "cuda" in str(device):
             torch.cuda.empty_cache()
