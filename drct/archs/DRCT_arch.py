@@ -457,9 +457,9 @@ class SwinTransformerBlock(nn.Module):
             # if window size is larger than input resolution, we don't partition windows
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        assert (
-            0 <= self.shift_size < self.window_size
-        ), "shift_size must in 0-window_size"
+        assert 0 <= self.shift_size < self.window_size, (
+            "shift_size must in 0-window_size"
+        )
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
@@ -488,6 +488,7 @@ class SwinTransformerBlock(nn.Module):
             attn_mask = None
 
         self.register_buffer("attn_mask", attn_mask)
+        self._mask_cache = {}
 
     def calculate_mask(self, x_size):
         # calculate attention mask for SW-MSA
@@ -547,13 +548,13 @@ class SwinTransformerBlock(nn.Module):
 
         # W-MSA/SW-MSA (to be compatible for testing on images whose shapes are the multiple of window size
         if self.input_resolution == x_size:
-            attn_windows = self.attn(
-                x_windows, mask=self.attn_mask
-            )  # nW*B, window_size*window_size, C
+            attn_windows = self.attn(x_windows, mask=self.attn_mask)
         else:
-            attn_windows = self.attn(
-                x_windows, mask=self.calculate_mask(x_size).to(x.device)
-            )
+            mask = self._mask_cache.get(x_size)
+            if mask is None:
+                mask = self.calculate_mask(x_size).to(x.device)
+                self._mask_cache[x_size] = mask
+            attn_windows = self.attn(x_windows, mask=mask)
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -641,46 +642,6 @@ class PatchMerging(nn.Module):
         flops = H * W * self.dim
         flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
         return flops
-
-
-class PatchMerging(nn.Module):
-    r"""Patch Merging Layer.
-
-    Args:
-        input_resolution (tuple[int]): Resolution of input feature.
-        dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-
-    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
-        self.norm = norm_layer(4 * dim)
-
-    def forward(self, x):
-        """
-        x: b, h*w, c
-        """
-        h, w = self.input_resolution
-        b, seq_len, c = x.shape
-        assert seq_len == h * w, "input feature has wrong size"
-        assert h % 2 == 0 and w % 2 == 0, f"x size ({h}*{w}) are not even."
-
-        x = x.view(b, h, w, c)
-
-        x0 = x[:, 0::2, 0::2, :]  # b h/2 w/2 c
-        x1 = x[:, 1::2, 0::2, :]  # b h/2 w/2 c
-        x2 = x[:, 0::2, 1::2, :]  # b h/2 w/2 c
-        x3 = x[:, 1::2, 1::2, :]  # b h/2 w/2 c
-        x = torch.cat([x0, x1, x2, x3], -1)  # b h/2 w/2 4*c
-        x = x.view(b, -1, 4 * c)  # b h/2*w/2 4*c
-
-        x = self.norm(x)
-        x = self.reduction(x)
-
-        return x
 
 
 class PatchEmbed(nn.Module):
@@ -795,7 +756,7 @@ class Upsample(nn.Sequential):
             m.append(nn.PixelShuffle(3))
         else:
             raise ValueError(
-                f"scale {scale} is not supported. " "Supported scales: 2^n and 3."
+                f"scale {scale} is not supported. Supported scales: 2^n and 3."
             )
         super(Upsample, self).__init__(*m)
 

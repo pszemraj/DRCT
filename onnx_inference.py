@@ -1,16 +1,16 @@
 import argparse
+import cv2
 import glob
 import json
-import os
-from pathlib import Path
-
-import cv2
 import numpy as np
 import onnxruntime as ort
-from tqdm.auto import tqdm
+import os
 
 # For PyTorch model loading and export
 import torch
+from pathlib import Path
+from tqdm.auto import tqdm
+
 from drct.archs.DRCT_arch import DRCT
 
 # Define image file extensions

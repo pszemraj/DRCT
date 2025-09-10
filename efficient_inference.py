@@ -1,14 +1,13 @@
-import math
-import torch
-import torch.nn as nn
 import argparse
+import cv2
 import glob
 import json
-import os
-from pathlib import Path
-
-import cv2
+import math
 import numpy as np
+import os
+import torch
+import torch.nn as nn
+from pathlib import Path
 from tqdm.auto import tqdm
 
 #############################################
@@ -232,9 +231,9 @@ class SwinTransformerBlock(nn.Module):
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        assert (
-            0 <= self.shift_size < self.window_size
-        ), "shift_size must be in 0-window_size"
+        assert 0 <= self.shift_size < self.window_size, (
+            "shift_size must be in 0-window_size"
+        )
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
@@ -782,8 +781,16 @@ def check_ampere_gpu():
 
 def test(img_lq, model, args, window_size):
     if args.tile is None:
-        with torch.inference_mode(), torch.autocast(
-            "cuda", enabled=torch.cuda.is_available()
+        with (
+            torch.inference_mode(),
+            torch.autocast(
+                "cuda",
+                dtype=torch.bfloat16
+                if args.precision == "bf16" and torch.cuda.is_available()
+                else torch.float16
+                if args.precision == "fp16" and torch.cuda.is_available()
+                else torch.float32,
+            ),
         ):
             output = model(img_lq)
     else:
@@ -797,42 +804,38 @@ def test(img_lq, model, args, window_size):
         h_idx_list = list(range(0, h - tile, stride)) + [h - tile]
         w_idx_list = list(range(0, w - tile, stride)) + [w - tile]
 
-        tile_coords = []
-        tile_patches = []
-        for h_idx in h_idx_list:
-            for w_idx in w_idx_list:
-                patch = img_lq[..., h_idx : h_idx + tile, w_idx : w_idx + tile]
-                tile_patches.append(patch)
-                tile_coords.append((h_idx, w_idx))
-        batch_size = args.tile_batch_size
-        out_patches = []
-        with torch.inference_mode(), torch.autocast(
-            "cuda", enabled=torch.cuda.is_available()
-        ):
-            for i in range(0, len(tile_patches), batch_size):
-                batch = torch.cat(tile_patches[i : i + batch_size], dim=0)
-                outs = model(batch)
-                for j in range(outs.shape[0]):
-                    out_patches.append(outs[j : j + 1])
-                torch.cuda.empty_cache()
-
-        E = torch.zeros(
-            b, c, h * sf, w * sf, device=img_lq.device, dtype=out_patches[0].dtype
-        )
+        coords = [(y, x) for y in h_idx_list for x in w_idx_list]
+        weight = None  # Add Hann weight later if needed
+        E = torch.zeros(b, c, h * sf, w * sf, device=img_lq.device, dtype=torch.float32)
         W = torch.zeros_like(E)
-        for (h_idx, w_idx), out_patch in zip(tile_coords, out_patches):
-            E[
-                :,
-                :,
-                h_idx * sf : (h_idx + tile) * sf,
-                w_idx * sf : (w_idx + tile) * sf,
-            ] += out_patch
-            W[
-                :,
-                :,
-                h_idx * sf : (h_idx + tile) * sf,
-                w_idx * sf : (w_idx + tile) * sf,
-            ] += 1.0
+
+        for i in range(0, len(coords), args.tile_batch_size):
+            ysxs = coords[i : i + args.tile_batch_size]
+            batch = torch.cat(
+                [img_lq[..., y : y + tile, x : x + tile] for (y, x) in ysxs], dim=0
+            )
+            with (
+                torch.inference_mode(),
+                torch.autocast(
+                    "cuda",
+                    dtype=torch.bfloat16
+                    if args.precision == "bf16" and torch.cuda.is_available()
+                    else torch.float16
+                    if args.precision == "fp16" and torch.cuda.is_available()
+                    else torch.float32,
+                ),
+            ):
+                outs = model(batch)
+            for j, (y, x) in enumerate(ysxs):
+                y0, y1 = y * sf, (y + tile) * sf
+                x0, x1 = x * sf, (x + tile) * sf
+                out = outs[j]
+                if weight is None:
+                    E[..., y0:y1, x0:x1] += out
+                    W[..., y0:y1, x0:x1] += 1.0
+                else:
+                    E[..., y0:y1, x0:x1] += out * weight
+                    W[..., y0:y1, x0:x1] += weight
         output = E / W
     return output
 
@@ -847,7 +850,7 @@ def main():
         "-m",
         "--model_path",
         type=str,
-        default="experiments/pretrained_models/DRCT-L_X4.pth",
+        default="weights/net_g_latest.pth",
         help="path to model checkpoint",
     )
     parser.add_argument("--output", type=str, default=None, help="output folder")
@@ -870,7 +873,18 @@ def main():
     parser.add_argument(
         "--jpeg_quality", type=int, default=90, help="JPEG quality (0-100)"
     )
-    parser.add_argument("--compile", action="store_true", help="use torch.compile")
+    parser.add_argument(
+        "--compile",
+        choices=["off", "reduce", "max"],
+        default="off",
+        help="torch.compile mode: off, reduce-overhead, max-autotune",
+    )
+    parser.add_argument(
+        "--precision",
+        choices=["fp32", "fp16", "bf16"],
+        default=None,
+        help="Precision: fp32, fp16, bf16 (auto-detected if None)",
+    )
     parser.add_argument(
         "-skip", "--skip_completed", action="store_true", help="skip completed images"
     )
@@ -881,6 +895,17 @@ def main():
         args.tile = None
 
     check_ampere_gpu()
+
+    # Set precision
+    if args.precision is None:
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 8:  # Ampere or later
+                args.precision = "bf16"
+            else:
+                args.precision = "fp16"
+        else:
+            args.precision = "fp32"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DRCT(
@@ -907,9 +932,15 @@ def main():
     model = model.to(device)
     model = model.to(memory_format=torch.channels_last)
 
-    if args.compile:
-        print("Compiling model...")
-        model = torch.compile(model, backend="reduce-overhead")
+    if args.compile != "off":
+        print(f"Compiling model with mode: {args.compile}")
+        backend = "reduce-overhead" if args.compile == "reduce" else "max-autotune"
+        try:
+            model = torch.compile(
+                model, mode=backend, fullgraph=True
+            )  # Force full graph compilation
+        except Exception as e:
+            print(f"Compilation failed: {e}, falling back to eager mode")
 
     window_size = 16
 
@@ -936,13 +967,18 @@ def main():
                 .float()
                 .pin_memory()
             )
-            img = img.unsqueeze(0).to(device, non_blocking=True)
+            img = (
+                img.unsqueeze(0)
+                .contiguous(memory_format=torch.channels_last)
+                .to(device, non_blocking=True)
+            )
 
             _, _, h_old, w_old = img.size()
             h_pad = (h_old // window_size + 1) * window_size - h_old
             w_pad = (w_old // window_size + 1) * window_size - w_old
-            img = torch.cat([img, torch.flip(img, [2])], 2)[:, :, : h_old + h_pad, :]
-            img = torch.cat([img, torch.flip(img, [3])], 3)[:, :, :, : w_old + w_pad]
+            import torch.nn.functional as F
+
+            img = F.pad(img, (0, w_pad, 0, h_pad), mode="reflect")
 
             output = test(img, model, args, window_size)
             output = output[..., : h_old * args.scale, : w_old * args.scale]

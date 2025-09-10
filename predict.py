@@ -35,9 +35,9 @@ class Predictor(BasePredictor):
             res_dir = os.path.join(
                 "results", "HAT_SRx4_ImageNet-LR", "visualization", "custom"
             )
-            assert (
-                len(os.listdir(res_dir)) == 1
-            ), "Should contain only one result for Single prediction."
+            assert len(os.listdir(res_dir)) == 1, (
+                "Should contain only one result for Single prediction."
+            )
             res = Image.open(os.path.join(res_dir, os.listdir(res_dir)[0]))
             res.save(str(output_path))
 
