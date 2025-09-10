@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.cuda.streams
 from pathlib import Path
+from typing import List, Tuple, Optional, Dict, Any
 from tqdm.auto import tqdm
 
 #############################################
@@ -740,7 +741,17 @@ class DRCT(nn.Module):
 image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.webp")
 
 
-def get_sorted_files_by_size(input_path, image_extensions):
+def get_sorted_files_by_size(input_path: str, image_extensions: Tuple[str, ...]) -> List[str]:
+    """
+    Get a list of files sorted by file size (ascending).
+
+    Args:
+        input_path: Path to the directory containing images
+        image_extensions: Tuple of image extensions to look for (e.g., ('*.jpg', '*.png'))
+
+    Returns:
+        List of file paths sorted by size (smallest to largest)
+    """
     case_insensitive_patterns = [
         os.path.join(input_path, ext.lower()) for ext in image_extensions
     ] + [os.path.join(input_path, ext.upper()) for ext in image_extensions]
@@ -753,7 +764,10 @@ def get_sorted_files_by_size(input_path, image_extensions):
     return input_files
 
 
-def check_ampere_gpu():
+def check_ampere_gpu() -> None:
+    """
+    Check if the GPU supports NVIDIA Ampere or later and enable TF32 in PyTorch if it does.
+    """
     if not torch.cuda.is_available():
         print("No GPU detected, running on CPU.")
         return
@@ -780,7 +794,19 @@ def check_ampere_gpu():
         print(f"Error occurred while checking GPU: {e}")
 
 
-def test(img_lq, model, args, window_size):
+def test(img_lq: torch.Tensor, model: nn.Module, args: argparse.Namespace, window_size: int) -> torch.Tensor:
+    """
+    Perform inference on input image tensor.
+
+    Args:
+        img_lq: Input low-quality image tensor
+        model: DRCT model instance
+        args: Parsed command line arguments
+        window_size: Size of processing window
+
+    Returns:
+        Output high-quality image tensor
+    """
     if args.tile is None:
         with (
             torch.inference_mode(),
@@ -856,7 +882,11 @@ def test(img_lq, model, args, window_size):
     return output
 
 
-def main():
+def main() -> None:
+    """
+    Main function to run DRCT inference on input images.
+    Parses command line arguments and processes all images in the input directory.
+    """
     parser = argparse.ArgumentParser(
         description="DRCT Inference",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
