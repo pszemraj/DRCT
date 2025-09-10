@@ -1,15 +1,14 @@
 import argparse
+import cv2
 import glob
 import json
-import os
-from pathlib import Path
-
-import cv2
 import numpy as np
+import os
 import torch
+from pathlib import Path
 from tqdm.auto import tqdm
 
-from drct.archs.DRCT_arch import *
+from drct.archs.DRCT_arch import DRCT
 
 # Define image file extensions
 image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.webp")

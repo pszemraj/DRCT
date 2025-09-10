@@ -1,15 +1,15 @@
-import math
-import torch
-import torch.nn as nn
 import argparse
+import cv2
 import glob
 import json
-import os
-from pathlib import Path
-
-import cv2
+import math
 import numpy as np
+import torch
+import torch.cuda.streams
+import torch.nn as nn
+from pathlib import Path
 from tqdm.auto import tqdm
+from typing import List, Tuple
 
 #############################################
 #           Model Utility Functions         #
@@ -232,9 +232,9 @@ class SwinTransformerBlock(nn.Module):
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        assert (
-            0 <= self.shift_size < self.window_size
-        ), "shift_size must be in 0-window_size"
+        assert 0 <= self.shift_size < self.window_size, (
+            "shift_size must be in 0-window_size"
+        )
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
@@ -740,20 +740,36 @@ class DRCT(nn.Module):
 image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.webp")
 
 
-def get_sorted_files_by_size(input_path, image_extensions):
+def get_sorted_files_by_size(
+    input_path: str, image_extensions: Tuple[str, ...]
+) -> List[str]:
+    """
+    Get a list of files sorted by file size (ascending).
+
+    Args:
+        input_path: Path to the directory containing images
+        image_extensions: Tuple of image extensions to look for (e.g., ('*.jpg', '*.png'))
+
+    Returns:
+        List of file paths sorted by size (smallest to largest)
+    """
+    input_path_obj = Path(input_path)
     case_insensitive_patterns = [
-        os.path.join(input_path, ext.lower()) for ext in image_extensions
-    ] + [os.path.join(input_path, ext.upper()) for ext in image_extensions]
+        str(input_path_obj / ext.lower()) for ext in image_extensions
+    ] + [str(input_path_obj / ext.upper()) for ext in image_extensions]
 
     input_files = []
     for pattern in case_insensitive_patterns:
         input_files.extend(glob.glob(pattern))
     input_files = list(dict.fromkeys(input_files))
-    input_files = sorted(input_files, key=lambda x: os.path.getsize(x))
+    input_files = sorted(input_files, key=lambda x: Path(x).stat().st_size)
     return input_files
 
 
-def check_ampere_gpu():
+def check_ampere_gpu() -> None:
+    """
+    Check if the GPU supports NVIDIA Ampere or later and enable TF32 in PyTorch if it does.
+    """
     if not torch.cuda.is_available():
         print("No GPU detected, running on CPU.")
         return
@@ -780,10 +796,32 @@ def check_ampere_gpu():
         print(f"Error occurred while checking GPU: {e}")
 
 
-def test(img_lq, model, args, window_size):
+def test(
+    img_lq: torch.Tensor, model: nn.Module, args: argparse.Namespace, window_size: int
+) -> torch.Tensor:
+    """
+    Perform inference on input image tensor.
+
+    Args:
+        img_lq: Input low-quality image tensor
+        model: DRCT model instance
+        args: Parsed command line arguments
+        window_size: Size of processing window
+
+    Returns:
+        Output high-quality image tensor
+    """
     if args.tile is None:
-        with torch.inference_mode(), torch.autocast(
-            "cuda", enabled=torch.cuda.is_available()
+        with (
+            torch.inference_mode(),
+            torch.autocast(
+                "cuda",
+                dtype=torch.bfloat16
+                if args.precision == "bf16" and torch.cuda.is_available()
+                else torch.float16
+                if args.precision == "fp16" and torch.cuda.is_available()
+                else torch.float32,
+            ),
         ):
             output = model(img_lq)
     else:
@@ -797,47 +835,66 @@ def test(img_lq, model, args, window_size):
         h_idx_list = list(range(0, h - tile, stride)) + [h - tile]
         w_idx_list = list(range(0, w - tile, stride)) + [w - tile]
 
-        tile_coords = []
-        tile_patches = []
-        for h_idx in h_idx_list:
-            for w_idx in w_idx_list:
-                patch = img_lq[..., h_idx : h_idx + tile, w_idx : w_idx + tile]
-                tile_patches.append(patch)
-                tile_coords.append((h_idx, w_idx))
-        batch_size = args.tile_batch_size
-        out_patches = []
-        with torch.inference_mode(), torch.autocast(
-            "cuda", enabled=torch.cuda.is_available()
-        ):
-            for i in range(0, len(tile_patches), batch_size):
-                batch = torch.cat(tile_patches[i : i + batch_size], dim=0)
-                outs = model(batch)
-                for j in range(outs.shape[0]):
-                    out_patches.append(outs[j : j + 1])
-                torch.cuda.empty_cache()
-
-        E = torch.zeros(
-            b, c, h * sf, w * sf, device=img_lq.device, dtype=out_patches[0].dtype
-        )
+        coords = [(y, x) for y in h_idx_list for x in w_idx_list]
+        weight = None  # Add Hann weight later if needed
+        E = torch.zeros(b, c, h * sf, w * sf, device=img_lq.device, dtype=torch.float32)
         W = torch.zeros_like(E)
-        for (h_idx, w_idx), out_patch in zip(tile_coords, out_patches):
-            E[
-                :,
-                :,
-                h_idx * sf : (h_idx + tile) * sf,
-                w_idx * sf : (w_idx + tile) * sf,
-            ] += out_patch
-            W[
-                :,
-                :,
-                h_idx * sf : (h_idx + tile) * sf,
-                w_idx * sf : (w_idx + tile) * sf,
-            ] += 1.0
+
+        # Create CUDA streams for overlap
+        streams = (
+            [torch.cuda.Stream() for _ in range(min(args.streams, len(coords)))]
+            if args.streams > 1 and torch.cuda.is_available()
+            else [torch.cuda.current_stream()]
+        )
+        stream_idx = 0
+
+        for i in range(0, len(coords), args.tile_batch_size):
+            ysxs = coords[i : i + args.tile_batch_size]
+            batch = torch.cat(
+                [img_lq[..., y : y + tile, x : x + tile] for (y, x) in ysxs], dim=0
+            )
+
+            current_stream = streams[stream_idx % len(streams)]
+            stream_idx += 1
+
+            with torch.cuda.stream(current_stream):
+                with (
+                    torch.inference_mode(),
+                    torch.autocast(
+                        "cuda",
+                        dtype=torch.bfloat16
+                        if args.precision == "bf16" and torch.cuda.is_available()
+                        else torch.float16
+                        if args.precision == "fp16" and torch.cuda.is_available()
+                        else torch.float32,
+                    ),
+                ):
+                    outs = model(batch)
+
+                for j, (y, x) in enumerate(ysxs):
+                    y0, y1 = y * sf, (y + tile) * sf
+                    x0, x1 = x * sf, (x + tile) * sf
+                    out = outs[j]
+                    if weight is None:
+                        E[..., y0:y1, x0:x1] += out
+                        W[..., y0:y1, x0:x1] += 1.0
+                    else:
+                        E[..., y0:y1, x0:x1] += out * weight
+                        W[..., y0:y1, x0:x1] += weight
+
+        # Wait for all streams to complete
+        if args.streams > 1 and torch.cuda.is_available():
+            for stream in streams:
+                stream.synchronize()
         output = E / W
     return output
 
 
-def main():
+def main() -> None:
+    """
+    Main function to run DRCT inference on input images.
+    Parses command line arguments and processes all images in the input directory.
+    """
     parser = argparse.ArgumentParser(
         description="DRCT Inference",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -847,7 +904,7 @@ def main():
         "-m",
         "--model_path",
         type=str,
-        default="experiments/pretrained_models/DRCT-L_X4.pth",
+        default="weights/net_g_latest.pth",
         help="path to model checkpoint",
     )
     parser.add_argument("--output", type=str, default=None, help="output folder")
@@ -870,9 +927,26 @@ def main():
     parser.add_argument(
         "--jpeg_quality", type=int, default=90, help="JPEG quality (0-100)"
     )
-    parser.add_argument("--compile", action="store_true", help="use torch.compile")
+    parser.add_argument(
+        "--compile",
+        choices=["off", "reduce", "max"],
+        default="off",
+        help="torch.compile mode: off, reduce-overhead, max-autotune (off by default)",
+    )
+    parser.add_argument(
+        "--precision",
+        choices=["fp32", "fp16", "bf16"],
+        default=None,
+        help="Precision: fp32, fp16, bf16 (auto-detected if None)",
+    )
     parser.add_argument(
         "-skip", "--skip_completed", action="store_true", help="skip completed images"
+    )
+    parser.add_argument(
+        "--streams",
+        type=int,
+        default=1,
+        help="Number of CUDA streams for H2D/compute overlap (default: 1)",
     )
     args = parser.parse_args()
     print(f"Running inference with args:\n{json.dumps(args.__dict__, indent=4)}")
@@ -881,6 +955,17 @@ def main():
         args.tile = None
 
     check_ampere_gpu()
+
+    # Set precision
+    if args.precision is None:
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 8:  # Ampere or later
+                args.precision = "bf16"
+            else:
+                args.precision = "fp16"
+        else:
+            args.precision = "fp32"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DRCT(
@@ -907,9 +992,28 @@ def main():
     model = model.to(device)
     model = model.to(memory_format=torch.channels_last)
 
-    if args.compile:
-        print("Compiling model...")
-        model = torch.compile(model, backend="reduce-overhead")
+    if args.compile != "off":
+        print(f"Compiling model with mode: {args.compile}")
+        backend = "reduce-overhead" if args.compile == "reduce" else "max-autotune"
+        try:
+            model = torch.compile(model, mode=backend, dynamic=True)
+            if (
+                args.input
+                and Path(args.input).is_dir()
+                and len(list(Path(args.input).iterdir())) > 1
+            ):
+                print("Running warmup inference...")
+                dummy_input = torch.randn(
+                    1, 3, 64, 64, device=device, dtype=torch.float32
+                )
+                dummy_input = dummy_input.contiguous(memory_format=torch.channels_last)
+                with (
+                    torch.inference_mode(),
+                    torch.autocast("cuda", dtype=torch.bfloat16),
+                ):
+                    _ = model(dummy_input)
+        except Exception as e:
+            print(f"Compilation failed: {e}, falling back to eager mode")
 
     window_size = 16
 
@@ -922,7 +1026,7 @@ def main():
 
     input_files = get_sorted_files_by_size(args.input, image_extensions)
     for path in tqdm(input_files, desc="inference"):
-        imgname = os.path.splitext(os.path.basename(path))[0]
+        imgname = Path(path).stem
         out_path = out_dir / f"{imgname}_DRCT-L_X{args.scale}.jpg"
 
         if args.skip_completed and out_path.exists():
@@ -936,13 +1040,18 @@ def main():
                 .float()
                 .pin_memory()
             )
-            img = img.unsqueeze(0).to(device, non_blocking=True)
+            img = (
+                img.unsqueeze(0)
+                .contiguous(memory_format=torch.channels_last)
+                .to(device, non_blocking=True)
+            )
 
             _, _, h_old, w_old = img.size()
             h_pad = (h_old // window_size + 1) * window_size - h_old
             w_pad = (w_old // window_size + 1) * window_size - w_old
-            img = torch.cat([img, torch.flip(img, [2])], 2)[:, :, : h_old + h_pad, :]
-            img = torch.cat([img, torch.flip(img, [3])], 3)[:, :, :, : w_old + w_pad]
+            import torch.nn.functional as F
+
+            img = F.pad(img, (0, w_pad, 0, h_pad), mode="reflect")
 
             output = test(img, model, args, window_size)
             output = output[..., : h_old * args.scale, : w_old * args.scale]
