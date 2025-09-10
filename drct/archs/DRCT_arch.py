@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from basicsr.archs.arch_util import to_2tuple, trunc_normal_
 from basicsr.utils.registry import ARCH_REGISTRY
@@ -202,45 +203,34 @@ class WindowAttention(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         B_, N, C = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(B_, N, 3, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        )
-        q, k, v = (
-            qkv[0],
-            qkv[1],
-            qkv[2],
-        )  # make torchscript happy (cannot use tensor as tuple)
-
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-
+        # Prepare tensors for SDPA
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads)
+        q, k, v = qkv.unbind(2)  # Split into q, k, v
+        q = q.transpose(1, 2) * self.scale  # [B_, num_heads, N, C//num_heads]
+        k = k.transpose(1, 2)  # [B_, num_heads, N, C//num_heads]
+        v = v.transpose(1, 2)  # [B_, num_heads, N, C//num_heads]
+        
+        # Prepare attention bias (relative position + window mask)
         relative_position_bias = self.relative_position_bias_table[
             self.relative_position_index.view(-1)
         ].view(
             self.window_size[0] * self.window_size[1],
             self.window_size[0] * self.window_size[1],
             -1,
-        )  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(
-            2, 0, 1
-        ).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
-
+        ).permute(2, 0, 1).contiguous()  # [num_heads, Wh*Ww, Wh*Ww]
+        
         if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(
-                1
-            ).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
+            # Expand mask to match attention shape and combine with relative position bias
+            attn_bias = relative_position_bias.unsqueeze(0) + mask.unsqueeze(1)
         else:
-            attn = self.softmax(attn)
-
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+            attn_bias = relative_position_bias.unsqueeze(0)
+        
+        # Use PyTorch's SDPA (will automatically use Flash Attention 2 when available)
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, dropout_p=self.attn_drop.p if self.training else 0.0)
+        
+        # Reshape and project
+        x = x.transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
