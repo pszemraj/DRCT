@@ -48,15 +48,20 @@
 **Why it helps**: Reduces redundant calculations in transformer blocks.
 **Usage**: Enabled by default. No user action required.
 
-### 7. SDPA Attention
-**What it does**: Uses PyTorch's Scaled Dot Product Attention (SDPA) with Flash Attention support.
-**Why it helps**: Leverages optimized kernels for faster attention computation.
+### 7. Flash Attention 2
+**What it does**: Uses PyTorch's Scaled Dot Product Attention (SDPA) with Flash Attention 2 support for memory-efficient attention computation.
+**Why it helps**: Reduces memory complexity from O(N²) to O(N) where N is sequence length (tile_size²), enabling larger tile sizes with less VRAM usage.
+**Memory impact**: 
+- Original attention: Memory scales with tile_size⁴
+- Flash Attention 2: Memory scales more linearly with tile_size²
+- Larger tiles (512x512, 1024x1024) see significant memory savings
 **Usage**: Enabled by default. No user action required.
+**Tradeoffs**: May show minimal speedup on small tiles but provides substantial benefits with larger tiles and longer sequences. Automatically falls back to standard attention on unsupported hardware.
 
 ## Usage Tips
 
 1. **For maximum speed**: Use `--precision bf16 --streams 2 --tile_batch_size 4`
-2. **For memory-constrained systems**: Reduce `--tile_batch_size` and `--tile` size
+2. **For memory-constrained systems**: Reduce `--tile_batch_size` and `--tile` size. With Flash Attention 2, you can use larger tiles (e.g., 512x512) with less memory penalty than before.
 3. **For quality-sensitive applications**: Use `--precision fp32` (slower but highest precision)
 4. **Monitor GPU utilization**: Use `nvidia-smi -l 1` to find optimal batch/stream settings
 
