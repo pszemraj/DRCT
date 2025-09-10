@@ -752,15 +752,16 @@ def get_sorted_files_by_size(input_path: str, image_extensions: Tuple[str, ...])
     Returns:
         List of file paths sorted by size (smallest to largest)
     """
+    input_path_obj = Path(input_path)
     case_insensitive_patterns = [
-        os.path.join(input_path, ext.lower()) for ext in image_extensions
-    ] + [os.path.join(input_path, ext.upper()) for ext in image_extensions]
+        str(input_path_obj / ext.lower()) for ext in image_extensions
+    ] + [str(input_path_obj / ext.upper()) for ext in image_extensions]
 
     input_files = []
     for pattern in case_insensitive_patterns:
         input_files.extend(glob.glob(pattern))
     input_files = list(dict.fromkeys(input_files))
-    input_files = sorted(input_files, key=lambda x: os.path.getsize(x))
+    input_files = sorted(input_files, key=lambda x: Path(x).stat().st_size)
     return input_files
 
 
@@ -986,7 +987,7 @@ def main() -> None:
         backend = "reduce-overhead" if args.compile == "reduce" else "max-autotune"
         try:
             model = torch.compile(model, mode=backend, dynamic=True)
-            if args.input and os.path.isdir(args.input) and len(os.listdir(args.input)) > 1:
+            if args.input and Path(args.input).is_dir() and len(list(Path(args.input).iterdir())) > 1:
                 print("Running warmup inference...")
                 dummy_input = torch.randn(1, 3, 64, 64, device=device, dtype=torch.float32)
                 dummy_input = dummy_input.contiguous(memory_format=torch.channels_last)
@@ -1006,7 +1007,7 @@ def main() -> None:
 
     input_files = get_sorted_files_by_size(args.input, image_extensions)
     for path in tqdm(input_files, desc="inference"):
-        imgname = os.path.splitext(os.path.basename(path))[0]
+        imgname = Path(path).stem
         out_path = out_dir / f"{imgname}_DRCT-L_X{args.scale}.jpg"
 
         if args.skip_completed and out_path.exists():
