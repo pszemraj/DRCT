@@ -4,13 +4,12 @@ import glob
 import json
 import math
 import numpy as np
-import os
 import torch
-import torch.nn as nn
 import torch.cuda.streams
+import torch.nn as nn
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
 from tqdm.auto import tqdm
+from typing import List, Tuple
 
 #############################################
 #           Model Utility Functions         #
@@ -741,7 +740,9 @@ class DRCT(nn.Module):
 image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.webp")
 
 
-def get_sorted_files_by_size(input_path: str, image_extensions: Tuple[str, ...]) -> List[str]:
+def get_sorted_files_by_size(
+    input_path: str, image_extensions: Tuple[str, ...]
+) -> List[str]:
     """
     Get a list of files sorted by file size (ascending).
 
@@ -795,7 +796,9 @@ def check_ampere_gpu() -> None:
         print(f"Error occurred while checking GPU: {e}")
 
 
-def test(img_lq: torch.Tensor, model: nn.Module, args: argparse.Namespace, window_size: int) -> torch.Tensor:
+def test(
+    img_lq: torch.Tensor, model: nn.Module, args: argparse.Namespace, window_size: int
+) -> torch.Tensor:
     """
     Perform inference on input image tensor.
 
@@ -838,18 +841,22 @@ def test(img_lq: torch.Tensor, model: nn.Module, args: argparse.Namespace, windo
         W = torch.zeros_like(E)
 
         # Create CUDA streams for overlap
-        streams = [torch.cuda.Stream() for _ in range(min(args.streams, len(coords)))] if args.streams > 1 and torch.cuda.is_available() else [torch.cuda.current_stream()]
+        streams = (
+            [torch.cuda.Stream() for _ in range(min(args.streams, len(coords)))]
+            if args.streams > 1 and torch.cuda.is_available()
+            else [torch.cuda.current_stream()]
+        )
         stream_idx = 0
-        
+
         for i in range(0, len(coords), args.tile_batch_size):
             ysxs = coords[i : i + args.tile_batch_size]
             batch = torch.cat(
                 [img_lq[..., y : y + tile, x : x + tile] for (y, x) in ysxs], dim=0
             )
-            
+
             current_stream = streams[stream_idx % len(streams)]
             stream_idx += 1
-            
+
             with torch.cuda.stream(current_stream):
                 with (
                     torch.inference_mode(),
@@ -863,7 +870,7 @@ def test(img_lq: torch.Tensor, model: nn.Module, args: argparse.Namespace, windo
                     ),
                 ):
                     outs = model(batch)
-                
+
                 for j, (y, x) in enumerate(ysxs):
                     y0, y1 = y * sf, (y + tile) * sf
                     x0, x1 = x * sf, (x + tile) * sf
@@ -874,7 +881,7 @@ def test(img_lq: torch.Tensor, model: nn.Module, args: argparse.Namespace, windo
                     else:
                         E[..., y0:y1, x0:x1] += out * weight
                         W[..., y0:y1, x0:x1] += weight
-        
+
         # Wait for all streams to complete
         if args.streams > 1 and torch.cuda.is_available():
             for stream in streams:
@@ -936,7 +943,10 @@ def main() -> None:
         "-skip", "--skip_completed", action="store_true", help="skip completed images"
     )
     parser.add_argument(
-        "--streams", type=int, default=1, help="Number of CUDA streams for H2D/compute overlap (default: 1)"
+        "--streams",
+        type=int,
+        default=1,
+        help="Number of CUDA streams for H2D/compute overlap (default: 1)",
     )
     args = parser.parse_args()
     print(f"Running inference with args:\n{json.dumps(args.__dict__, indent=4)}")
@@ -987,11 +997,20 @@ def main() -> None:
         backend = "reduce-overhead" if args.compile == "reduce" else "max-autotune"
         try:
             model = torch.compile(model, mode=backend, dynamic=True)
-            if args.input and Path(args.input).is_dir() and len(list(Path(args.input).iterdir())) > 1:
+            if (
+                args.input
+                and Path(args.input).is_dir()
+                and len(list(Path(args.input).iterdir())) > 1
+            ):
                 print("Running warmup inference...")
-                dummy_input = torch.randn(1, 3, 64, 64, device=device, dtype=torch.float32)
+                dummy_input = torch.randn(
+                    1, 3, 64, 64, device=device, dtype=torch.float32
+                )
                 dummy_input = dummy_input.contiguous(memory_format=torch.channels_last)
-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                with (
+                    torch.inference_mode(),
+                    torch.autocast("cuda", dtype=torch.bfloat16),
+                ):
                     _ = model(dummy_input)
         except Exception as e:
             print(f"Compilation failed: {e}, falling back to eager mode")

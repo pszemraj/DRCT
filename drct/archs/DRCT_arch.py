@@ -209,26 +209,37 @@ class WindowAttention(nn.Module):
         q = q.transpose(1, 2) * self.scale  # [B_, num_heads, N, C//num_heads]
         k = k.transpose(1, 2)  # [B_, num_heads, N, C//num_heads]
         v = v.transpose(1, 2)  # [B_, num_heads, N, C//num_heads]
-        
+
         # Prepare attention bias (relative position + window mask)
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ].view(
-            self.window_size[0] * self.window_size[1],
-            self.window_size[0] * self.window_size[1],
-            -1,
-        ).permute(2, 0, 1).contiguous()  # [num_heads, Wh*Ww, Wh*Ww]
-        
+        relative_position_bias = (
+            self.relative_position_bias_table[self.relative_position_index.view(-1)]
+            .view(
+                self.window_size[0] * self.window_size[1],
+                self.window_size[0] * self.window_size[1],
+                -1,
+            )
+            .permute(2, 0, 1)
+            .contiguous()
+        )  # [num_heads, Wh*Ww, Wh*Ww]
+
         if mask is not None:
             # Expand mask to match attention shape and combine with relative position bias
             attn_bias = relative_position_bias.unsqueeze(0) + mask.unsqueeze(1)
         else:
             attn_bias = relative_position_bias.unsqueeze(0)
-        
+
         # Use PyTorch's SDPA (will automatically use Flash Attention 2 when available)
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
-            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, dropout_p=self.attn_drop.p if self.training else 0.0)
-        
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=True, enable_mem_efficient=True, enable_math=True
+        ):
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_bias,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )
+
         # Reshape and project
         x = x.transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
