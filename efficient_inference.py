@@ -1044,9 +1044,9 @@ def main() -> None:
     parser.add_argument("--jpeg_quality", type=int, default=90, help="JPEG quality (0-100)")
     parser.add_argument(
         "--compile",
-        choices=["off", "reduce", "max"],
+        choices=["off", "default", "reduce", "max"],
         default="off",
-        help="torch.compile mode: off, reduce-overhead, max-autotune (off by default)",
+        help="torch.compile mode: off, default, reduce-overhead, max-autotune (off by default)",
     )
     parser.add_argument(
         "--precision",
@@ -1108,7 +1108,12 @@ def main() -> None:
 
     if args.compile != "off":
         print(f"Compiling model with mode: {args.compile}")
-        mode = "reduce-overhead" if args.compile == "reduce" else "max-autotune"
+        if args.compile == "default":
+            mode = "default"
+        elif args.compile == "reduce":
+            mode = "reduce-overhead"
+        else:  # max
+            mode = "max-autotune"
         try:
             audit_buffers(model)  # fail early on stray CPU buffers
 
