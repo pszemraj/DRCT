@@ -1045,7 +1045,7 @@ def main() -> None:
     input_files = get_sorted_files_by_size(args.input, image_extensions)
     for path in tqdm(input_files, desc="inference"):
         imgname = Path(path).stem
-        out_path = out_dir / f"{imgname}_DRCT-L_X{args.scale}.jpg"
+        out_path = out_dir / f"{imgname}.jpg"
 
         if args.skip_completed and out_path.exists():
             print(f"Skipping completed image: {out_path.name}")
@@ -1074,6 +1074,12 @@ def main() -> None:
             output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))
             output = (output * 255.0).round().astype(np.uint8)
             cv2.imwrite(str(out_path), output, [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
+    
+    # Save inference configuration
+    config_path = out_dir / "inference_config.json"
+    with open(config_path, "w") as f:
+        json.dump(args.__dict__, f, indent=2)
+    print(f"Inference configuration saved to: {config_path}")
 
 
 if __name__ == "__main__":

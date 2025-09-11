@@ -1,11 +1,12 @@
 import argparse
-import cv2
 import glob
 import json
-import numpy as np
 import os
-import torch
 from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
 from tqdm.auto import tqdm
 
 from drct.archs.DRCT_arch import DRCT

@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+
 from cog import BasePredictor, Input, Path
 from PIL import Image
 
