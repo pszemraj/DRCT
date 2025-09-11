@@ -1,6 +1,7 @@
 import os
 import subprocess
 
+
 def get_git_hash():
     def _minimal_ext_cmd(cmd):
         env = {}

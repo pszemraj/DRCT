@@ -1,22 +1,111 @@
+"""DRCT (Dense Residual Connected Transformer) efficient inference script.
+
+This module provides optimized inference for DRCT super-resolution models with:
+- Memory format optimization (channels_last)
+- Mixed precision support (fp32/fp16/bf16)
+- Batched tile processing for large images
+- CUDA stream overlap for improved throughput
+- Efficient padding strategies
+"""
+
 import argparse
-import cv2
 import glob
 import json
+import logging as pylog
 import math
+import os
+import warnings
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
+import cv2
 import numpy as np
 import torch
+import torch._dynamo as dynamo
+import torch._logging as tlog
 import torch.cuda.streams
 import torch.nn as nn
-from pathlib import Path
+import torch.nn.functional as F
+from torch._inductor import config as inductor
 from tqdm.auto import tqdm
-from typing import List, Tuple
+
+# Configure logging for better debugging
+os.environ.setdefault("TORCH_LOGS", "+dynamo,graph_breaks,guards,recompiles,inductor,output_code,cudagraphs")
+warnings.simplefilter("default")
+pylog.basicConfig(level=pylog.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+# Make compilation failures visible
+dynamo.config.suppress_errors = False
+dynamo.config.verbose = True
+
+# Enable torch logging if available
+try:
+    tlog.set_logs(
+        dynamo="debug",
+        graph_breaks=True,
+        guards=True,
+        recompiles=True,
+        inductor="debug",
+        cudagraphs=True,
+        output_code=True,
+    )
+except Exception:
+    pass
+
+# Write debug artifacts
+try:
+    inductor.debug = True
+    inductor.print_kernel_source = True
+    inductor.debug_dir = "torch_compile_debug"
+except Exception:
+    pass
 
 #############################################
 #           Model Utility Functions         #
 #############################################
 
 
-def drop_path(x, drop_prob: float = 0.0, training: bool = False):
+def log(msg):
+    """Log message through tqdm to avoid output conflicts."""
+    try:
+        tqdm.write(str(msg))
+    except Exception:
+        print(msg, flush=True)
+
+
+def audit_buffers(model):
+    """Check for CPU buffers that would break compilation."""
+    bad = [(n, b.device, b.dtype) for n, b in model.named_buffers() if not b.is_cuda]
+    if bad:
+        raise RuntimeError(f"CPU buffers found: {bad}")
+
+
+def _dry_run_compile(model, device, tile, amp_dtype=torch.bfloat16, mode="reduce-overhead"):
+    x = torch.zeros(1, 3, tile, tile, device=device).contiguous(memory_format=torch.channels_last)
+    # list graph breaks, then force fullgraph capture
+    try:
+        from torch._dynamo import explain
+        # Use the new API: explain(model)(x) instead of explain(model, x)
+        explanation = explain(model)(x)
+        print(f"Graph breaks: {explanation.graph_break_count}")
+    except Exception as e:
+        print(f"[dynamo.explain] Skipping analysis: {str(e)[:100]}")
+    m = torch.compile(model, mode=mode, fullgraph=True, dynamic=False)
+    with torch.inference_mode(), torch.autocast("cuda", dtype=amp_dtype):
+        _ = m(x)  # raises if any break remains
+
+
+def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
+    """Drop paths (Stochastic Depth) per sample.
+
+    Args:
+        x: Input tensor
+        drop_prob: Probability of dropping path
+        training: Whether in training mode
+
+    Returns:
+        Output tensor with paths potentially dropped
+    """
     if drop_prob == 0.0 or not training:
         return x
     keep_prob = 1 - drop_prob
@@ -28,16 +117,26 @@ def drop_path(x, drop_prob: float = 0.0, training: bool = False):
 
 
 class DropPath(nn.Module):
-    def __init__(self, drop_prob=None):
+    """Drop paths (Stochastic Depth) per sample."""
+
+    def __init__(self, drop_prob: Optional[float] = None):
         super(DropPath, self).__init__()
         self.drop_prob = drop_prob
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return drop_path(x, self.drop_prob, self.training)
 
 
 class ChannelAttention(nn.Module):
-    def __init__(self, num_feat, squeeze_factor=16):
+    """Channel attention module for feature recalibration."""
+
+    def __init__(self, num_feat: int, squeeze_factor: int = 16):
+        """Initialize channel attention.
+
+        Args:
+            num_feat: Number of input features
+            squeeze_factor: Channel reduction factor
+        """
         super(ChannelAttention, self).__init__()
         self.attention = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -47,13 +146,22 @@ class ChannelAttention(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.attention(x)
         return x * y
 
 
 class CAB(nn.Module):
-    def __init__(self, num_feat, compress_ratio=3, squeeze_factor=30):
+    """Channel Attention Block with compression."""
+
+    def __init__(self, num_feat: int, compress_ratio: int = 3, squeeze_factor: int = 30):
+        """Initialize CAB.
+
+        Args:
+            num_feat: Number of features
+            compress_ratio: Feature compression ratio
+            squeeze_factor: Channel attention squeeze factor
+        """
         super(CAB, self).__init__()
         self.cab = nn.Sequential(
             nn.Conv2d(num_feat, num_feat // compress_ratio, 3, 1, 1),
@@ -62,7 +170,7 @@ class CAB(nn.Module):
             ChannelAttention(num_feat, squeeze_factor),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.cab(x)
 
 
@@ -92,28 +200,46 @@ class Mlp(nn.Module):
         return x
 
 
-def to_2tuple(x):
+def to_2tuple(x: Union[int, Tuple[int, int]]) -> Tuple[int, int]:
+    """Convert single int to 2-tuple."""
     return (x, x) if isinstance(x, int) else x
 
 
-def trunc_normal_(tensor, std=0.02):
+def trunc_normal_(tensor: torch.Tensor, std: float = 0.02) -> None:
+    """Initialize tensor with truncated normal distribution."""
     nn.init.trunc_normal_(tensor, std=std)
 
 
-def window_partition(x, window_size):
+def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
+    """Partition image into windows.
+
+    Args:
+        x: Input tensor (B, H, W, C)
+        window_size: Window size
+
+    Returns:
+        Windows tensor (num_windows*B, window_size, window_size, C)
+    """
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = (
-        x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    )
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
 
-def window_reverse(windows, window_size, H, W):
+def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int) -> torch.Tensor:
+    """Reverse window partition.
+
+    Args:
+        windows: Windows tensor
+        window_size: Window size
+        H: Height
+        W: Width
+
+    Returns:
+        Merged tensor (B, H, W, C)
+    """
     B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.view(
-        B, H // window_size, W // window_size, window_size, window_size, -1
-    )
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
@@ -124,16 +250,29 @@ def window_reverse(windows, window_size, H, W):
 
 
 class WindowAttention(nn.Module):
+    """Window-based multi-head self attention module."""
+
     def __init__(
         self,
-        dim,
-        window_size,
-        num_heads,
-        qkv_bias=True,
-        qk_scale=None,
-        attn_drop=0.0,
-        proj_drop=0.0,
+        dim: int,
+        window_size: Tuple[int, int],
+        num_heads: int,
+        qkv_bias: bool = True,
+        qk_scale: Optional[float] = None,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
     ):
+        """Initialize WindowAttention.
+
+        Args:
+            dim: Number of input channels
+            window_size: Window size (height, width)
+            num_heads: Number of attention heads
+            qkv_bias: Whether to add bias to qkv projection
+            qk_scale: Override default qk scale
+            attn_drop: Attention dropout rate
+            proj_drop: Projection dropout rate
+        """
         super().__init__()
         self.dim = dim
         self.window_size = window_size  # tuple (Wh, Ww)
@@ -165,13 +304,9 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=0.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask=None):
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B_, N, C = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(B_, N, 3, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        )
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
@@ -190,9 +325,7 @@ class WindowAttention(nn.Module):
 
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(
-                1
-            ).unsqueeze(0)
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
@@ -206,22 +339,41 @@ class WindowAttention(nn.Module):
 
 
 class SwinTransformerBlock(nn.Module):
+    """Swin Transformer Block with shifted window attention."""
+
     def __init__(
         self,
-        dim,
-        input_resolution,
-        num_heads,
-        window_size=7,
-        shift_size=0,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        qk_scale=None,
-        drop=0.0,
-        attn_drop=0.0,
-        drop_path=0.0,
-        act_layer=nn.GELU,
-        norm_layer=nn.LayerNorm,
+        dim: int,
+        input_resolution: Tuple[int, int],
+        num_heads: int,
+        window_size: int = 7,
+        shift_size: int = 0,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        qk_scale: Optional[float] = None,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+        act_layer: nn.Module = nn.GELU,
+        norm_layer: nn.Module = nn.LayerNorm,
     ):
+        """Initialize SwinTransformerBlock.
+
+        Args:
+            dim: Number of input channels
+            input_resolution: Input resolution (H, W)
+            num_heads: Number of attention heads
+            window_size: Window size
+            shift_size: Shift size for shifted window attention
+            mlp_ratio: MLP expansion ratio
+            qkv_bias: Whether to add bias to qkv
+            qk_scale: Override default qk scale
+            drop: Dropout rate
+            attn_drop: Attention dropout rate
+            drop_path: Stochastic depth rate
+            act_layer: Activation layer
+            norm_layer: Normalization layer
+        """
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -232,9 +384,7 @@ class SwinTransformerBlock(nn.Module):
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, (
-            "shift_size must be in 0-window_size"
-        )
+        assert 0 <= self.shift_size < self.window_size, "shift_size must be in 0-window_size"
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
@@ -258,15 +408,18 @@ class SwinTransformerBlock(nn.Module):
         )
 
         if self.shift_size > 0:
-            attn_mask = self.calculate_mask(self.input_resolution)
+            # Pre-calculate mask but don't register as buffer yet (will move to device later)
+            attn_mask = None  # Will be created on-demand with correct device
         else:
             attn_mask = None
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def calculate_mask(self, x_size):
+    def calculate_mask(self, x_size: Tuple[int, int], device=None) -> torch.Tensor:
+        """Calculate attention mask for shifted window attention."""
         H, W = x_size
-        img_mask = torch.zeros((1, H, W, 1))
+        # Create mask on the correct device from the start
+        img_mask = torch.zeros((1, H, W, 1), device=device if device is not None else "cpu")
         h_slices = (
             slice(0, -self.window_size),
             slice(-self.window_size, -self.shift_size),
@@ -286,12 +439,10 @@ class SwinTransformerBlock(nn.Module):
         mask_windows = window_partition(img_mask, self.window_size)
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(
-            attn_mask == 0, float(0.0)
-        )
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
         return attn_mask
 
-    def forward(self, x, x_size):
+    def forward(self, x: torch.Tensor, x_size: Tuple[int, int]) -> torch.Tensor:
         H, W = x_size
         B, L, C = x.shape
         shortcut = x
@@ -299,9 +450,7 @@ class SwinTransformerBlock(nn.Module):
         x = x.view(B, H, W, C)
 
         if self.shift_size > 0:
-            shifted_x = torch.roll(
-                x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2)
-            )
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
             shifted_x = x
 
@@ -309,19 +458,28 @@ class SwinTransformerBlock(nn.Module):
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
         if self.input_resolution == x_size:
-            attn_windows = self.attn(x_windows, mask=self.attn_mask)
+            # Use cached mask if available and on correct device
+            if self.attn_mask is not None:
+                attn_windows = self.attn(x_windows, mask=self.attn_mask)
+            elif self.shift_size > 0:
+                # Create mask on demand with correct device
+                if self.attn_mask is None:
+                    self.attn_mask = self.calculate_mask(self.input_resolution, device=x.device)
+                attn_windows = self.attn(x_windows, mask=self.attn_mask)
+            else:
+                attn_windows = self.attn(x_windows, mask=None)
         else:
-            attn_windows = self.attn(
-                x_windows, mask=self.calculate_mask(x_size).to(x.device)
-            )
+            # Different size, calculate new mask
+            if self.shift_size > 0:
+                attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size, device=x.device))
+            else:
+                attn_windows = self.attn(x_windows, mask=None)
 
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
         shifted_x = window_reverse(attn_windows, self.window_size, H, W)
 
         if self.shift_size > 0:
-            x = torch.roll(
-                shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2)
-            )
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
         x = x.view(B, H * W, C)
@@ -450,39 +608,17 @@ class RDG(nn.Module):
             norm_layer=None,
         )
 
-    def forward(self, x, xsize):
+    def forward(self, x: torch.Tensor, xsize: Tuple[int, int]) -> torch.Tensor:
         x1 = self.pe(self.lrelu(self.adjust1(self.pue(self.swin1(x, xsize), xsize))))
-        x2 = self.pe(
-            self.lrelu(
-                self.adjust2(self.pue(self.swin2(torch.cat((x, x1), -1), xsize), xsize))
-            )
-        )
-        x3 = self.pe(
-            self.lrelu(
-                self.adjust3(
-                    self.pue(self.swin3(torch.cat((x, x1, x2), -1), xsize), xsize)
-                )
-            )
-        )
-        x4 = self.pe(
-            self.lrelu(
-                self.adjust4(
-                    self.pue(self.swin4(torch.cat((x, x1, x2, x3), -1), xsize), xsize)
-                )
-            )
-        )
-        x5 = self.pe(
-            self.adjust5(
-                self.pue(self.swin5(torch.cat((x, x1, x2, x3, x4), -1), xsize), xsize)
-            )
-        )
+        x2 = self.pe(self.lrelu(self.adjust2(self.pue(self.swin2(torch.cat((x, x1), -1), xsize), xsize))))
+        x3 = self.pe(self.lrelu(self.adjust3(self.pue(self.swin3(torch.cat((x, x1, x2), -1), xsize), xsize))))
+        x4 = self.pe(self.lrelu(self.adjust4(self.pue(self.swin4(torch.cat((x, x1, x2, x3), -1), xsize), xsize))))
+        x5 = self.pe(self.adjust5(self.pue(self.swin5(torch.cat((x, x1, x2, x3, x4), -1), xsize), xsize)))
         return x5 * 0.2 + x
 
 
 class PatchEmbed(nn.Module):
-    def __init__(
-        self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None
-    ):
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
@@ -509,22 +645,14 @@ class PatchEmbed(nn.Module):
 
     def flops(self):
         Ho, Wo = self.patches_resolution
-        flops = (
-            Ho
-            * Wo
-            * self.embed_dim
-            * self.in_chans
-            * (self.patch_size[0] * self.patch_size[1])
-        )
+        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops
 
 
 class PatchUnEmbed(nn.Module):
-    def __init__(
-        self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None
-    ):
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
@@ -556,13 +684,13 @@ class Upsample(nn.Sequential):
             m.append(nn.Conv2d(num_feat, 9 * num_feat, 3, 1, 1))
             m.append(nn.PixelShuffle(3))
         else:
-            raise ValueError(
-                f"scale {scale} is not supported. Supported scales: 2^n and 3."
-            )
+            raise ValueError(f"scale {scale} is not supported. Supported scales: 2^n and 3.")
         super(Upsample, self).__init__(*m)
 
 
 class DRCT(nn.Module):
+    """Dense Residual Connected Transformer for image super-resolution."""
+
     def __init__(
         self,
         img_size=64,
@@ -605,9 +733,10 @@ class DRCT(nn.Module):
         self.img_range = img_range
         if in_chans == 3:
             rgb_mean = (0.4488, 0.4371, 0.4040)
-            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
+            # Register as buffer so it moves to device automatically
+            self.register_buffer("mean", torch.Tensor(rgb_mean).view(1, 3, 1, 1))
         else:
-            self.mean = torch.zeros(1, 1, 1, 1)
+            self.register_buffer("mean", torch.zeros(1, 1, 1, 1))
         self.upscale = upscale
         self.upsampler = upsampler
 
@@ -643,9 +772,7 @@ class DRCT(nn.Module):
         )
 
         if self.ape:
-            self.absolute_pos_embed = nn.Parameter(
-                torch.zeros(1, num_patches, embed_dim)
-            )
+            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
             trunc_normal_(self.absolute_pos_embed, std=0.02)
 
         self.pos_drop = nn.Dropout(p=drop_rate)
@@ -718,8 +845,16 @@ class DRCT(nn.Module):
         x = self.patch_unembed(x, x_size)
         return x
 
-    def forward(self, x):
-        self.mean = self.mean.type_as(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through DRCT model.
+
+        Args:
+            x: Input image tensor (B, C, H, W)
+
+        Returns:
+            Super-resolved image tensor
+        """
+        # No need to move mean as it's now a buffer that moves with the model
         x = (x - self.mean) * self.img_range
 
         if self.upsampler == "pixelshuffle":
@@ -740,9 +875,7 @@ class DRCT(nn.Module):
 image_extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff", "*.webp")
 
 
-def get_sorted_files_by_size(
-    input_path: str, image_extensions: Tuple[str, ...]
-) -> List[str]:
+def get_sorted_files_by_size(input_path: str, image_extensions: Tuple[str, ...]) -> List[str]:
     """
     Get a list of files sorted by file size (ascending).
 
@@ -754,9 +887,9 @@ def get_sorted_files_by_size(
         List of file paths sorted by size (smallest to largest)
     """
     input_path_obj = Path(input_path)
-    case_insensitive_patterns = [
-        str(input_path_obj / ext.lower()) for ext in image_extensions
-    ] + [str(input_path_obj / ext.upper()) for ext in image_extensions]
+    case_insensitive_patterns = [str(input_path_obj / ext.lower()) for ext in image_extensions] + [
+        str(input_path_obj / ext.upper()) for ext in image_extensions
+    ]
 
     input_files = []
     for pattern in case_insensitive_patterns:
@@ -787,18 +920,14 @@ def check_ampere_gpu() -> None:
             )
         else:
             gpu_name = torch.cuda.get_device_name(device)
-            print(
-                f"{gpu_name} (compute capability {major}.{minor}) does not support NVIDIA Ampere or later."
-            )
+            print(f"{gpu_name} (compute capability {major}.{minor}) does not support NVIDIA Ampere or later.")
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.preferred_linalg_library = "cusolver"
     except Exception as e:
         print(f"Error occurred while checking GPU: {e}")
 
 
-def test(
-    img_lq: torch.Tensor, model: nn.Module, args: argparse.Namespace, window_size: int
-) -> torch.Tensor:
+def test(img_lq: torch.Tensor, model: nn.Module, args: argparse.Namespace, window_size: int) -> torch.Tensor:
     """
     Perform inference on input image tensor.
 
@@ -812,16 +941,13 @@ def test(
         Output high-quality image tensor
     """
     if args.tile is None:
-        with (
-            torch.inference_mode(),
-            torch.autocast(
-                "cuda",
-                dtype=torch.bfloat16
-                if args.precision == "bf16" and torch.cuda.is_available()
-                else torch.float16
-                if args.precision == "fp16" and torch.cuda.is_available()
-                else torch.float32,
-            ),
+        with torch.inference_mode(), torch.autocast(
+            "cuda",
+            dtype=torch.bfloat16
+            if args.precision == "bf16" and torch.cuda.is_available()
+            else torch.float16
+            if args.precision == "fp16" and torch.cuda.is_available()
+            else torch.float32,
         ):
             output = model(img_lq)
     else:
@@ -850,24 +976,19 @@ def test(
 
         for i in range(0, len(coords), args.tile_batch_size):
             ysxs = coords[i : i + args.tile_batch_size]
-            batch = torch.cat(
-                [img_lq[..., y : y + tile, x : x + tile] for (y, x) in ysxs], dim=0
-            )
+            batch = torch.cat([img_lq[..., y : y + tile, x : x + tile] for (y, x) in ysxs], dim=0)
 
             current_stream = streams[stream_idx % len(streams)]
             stream_idx += 1
 
             with torch.cuda.stream(current_stream):
-                with (
-                    torch.inference_mode(),
-                    torch.autocast(
-                        "cuda",
-                        dtype=torch.bfloat16
-                        if args.precision == "bf16" and torch.cuda.is_available()
-                        else torch.float16
-                        if args.precision == "fp16" and torch.cuda.is_available()
-                        else torch.float32,
-                    ),
+                with torch.inference_mode(), torch.autocast(
+                    "cuda",
+                    dtype=torch.bfloat16
+                    if args.precision == "bf16" and torch.cuda.is_available()
+                    else torch.float16
+                    if args.precision == "fp16" and torch.cuda.is_available()
+                    else torch.float32,
                 ):
                     outs = model(batch)
 
@@ -915,23 +1036,19 @@ def main() -> None:
         default=256,
         help="Tile size, -1 for no tile during inference (inference on whole image)",
     )
-    parser.add_argument(
-        "--tile_overlap", type=int, default=16, help="Overlapping of different tiles"
-    )
+    parser.add_argument("--tile_overlap", type=int, default=16, help="Overlapping of different tiles")
     parser.add_argument(
         "--tile_batch_size",
         type=int,
         default=1,
         help="Mini-batch size for tile processing to reduce memory usage",
     )
-    parser.add_argument(
-        "--jpeg_quality", type=int, default=90, help="JPEG quality (0-100)"
-    )
+    parser.add_argument("--jpeg_quality", type=int, default=90, help="JPEG quality (0-100)")
     parser.add_argument(
         "--compile",
-        choices=["off", "reduce", "max"],
+        choices=["off", "default", "reduce", "max"],
         default="off",
-        help="torch.compile mode: off, reduce-overhead, max-autotune (off by default)",
+        help="torch.compile mode: off, default, reduce-overhead, max-autotune (off by default)",
     )
     parser.add_argument(
         "--precision",
@@ -939,9 +1056,7 @@ def main() -> None:
         default=None,
         help="Precision: fp32, fp16, bf16 (auto-detected if None)",
     )
-    parser.add_argument(
-        "-skip", "--skip_completed", action="store_true", help="skip completed images"
-    )
+    parser.add_argument("-skip", "--skip_completed", action="store_true", help="skip completed images")
     parser.add_argument(
         "--streams",
         type=int,
@@ -987,47 +1102,58 @@ def main() -> None:
         resi_connection="1conv",
     )
     checkpoint = torch.load(args.model_path, map_location=device)
-    model.load_state_dict(checkpoint["params"], strict=True)
+    # Load state dict with strict=False to handle missing buffer
+    model.load_state_dict(checkpoint["params"], strict=False)
     model.eval()
     model = model.to(device)
     model = model.to(memory_format=torch.channels_last)
 
     if args.compile != "off":
         print(f"Compiling model with mode: {args.compile}")
-        backend = "reduce-overhead" if args.compile == "reduce" else "max-autotune"
+        if args.compile == "default":
+            mode = "default"
+        elif args.compile == "reduce":
+            mode = "reduce-overhead"
+        else:  # max
+            mode = "max-autotune"
         try:
-            model = torch.compile(model, mode=backend, dynamic=True)
-            if (
-                args.input
-                and Path(args.input).is_dir()
-                and len(list(Path(args.input).iterdir())) > 1
-            ):
+            audit_buffers(model)  # fail early on stray CPU buffers
+
+            # use the actual tile, not 64, to avoid recompiles and mask mismatches
+            tile = int(args.tile) if getattr(args, "tile", None) else 64
+
+            # dry run: fullgraph=True to surface the latest break loudly
+            # Note: dry run can fail with fake OOM or other issues, so we make it optional
+            if os.environ.get("SKIP_DRY_RUN", "0") != "1":
+                try:
+                    _dry_run_compile(model, device, tile, amp_dtype=torch.bfloat16, mode=mode)
+                    print("Dry run succeeded - model is fully compilable!")
+                except Exception as e:
+                    print(f"Dry run failed (expected): {str(e)[:100]}...")
+                    print("Proceeding with partial compilation...")
+
+            # real compile for execution: keep shapes static for cudagraphs
+            model = torch.compile(model, mode=mode, dynamic=False)
+
+            # warmup on exact tile, channels_last, and same AMP dtype
+            if args.input and Path(args.input).is_dir() and len(list(Path(args.input).iterdir())) > 1:
                 print("Running warmup inference...")
-                dummy_input = torch.randn(
-                    1, 3, 64, 64, device=device, dtype=torch.float32
-                )
-                dummy_input = dummy_input.contiguous(memory_format=torch.channels_last)
-                with (
-                    torch.inference_mode(),
-                    torch.autocast("cuda", dtype=torch.bfloat16),
-                ):
-                    _ = model(dummy_input)
+                dummy = torch.zeros(1, 3, tile, tile, device=device).contiguous(memory_format=torch.channels_last)
+                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    _ = model(dummy)
+
         except Exception as e:
             print(f"Compilation failed: {e}, falling back to eager mode")
 
     window_size = 16
 
-    out_dir = (
-        Path(args.output)
-        if args.output is not None
-        else Path(args.input) / "upscaled-DRCT-outputs"
-    )
+    out_dir = Path(args.output) if args.output is not None else Path(args.input) / "upscaled-DRCT-outputs"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     input_files = get_sorted_files_by_size(args.input, image_extensions)
     for path in tqdm(input_files, desc="inference"):
         imgname = Path(path).stem
-        out_path = out_dir / f"{imgname}_DRCT-L_X{args.scale}.jpg"
+        out_path = out_dir / f"{imgname}.jpg"
 
         if args.skip_completed and out_path.exists():
             print(f"Skipping completed image: {out_path.name}")
@@ -1035,22 +1161,14 @@ def main() -> None:
 
         try:
             img = cv2.imread(path, cv2.IMREAD_COLOR).astype(np.float32) / 255.0
-            img = (
-                torch.from_numpy(np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1)))
-                .float()
-                .pin_memory()
-            )
-            img = (
-                img.unsqueeze(0)
-                .contiguous(memory_format=torch.channels_last)
-                .to(device, non_blocking=True)
-            )
+            img = torch.from_numpy(np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))).float().pin_memory()
+            img = img.unsqueeze(0).contiguous(memory_format=torch.channels_last).to(device, non_blocking=True)
 
             _, _, h_old, w_old = img.size()
             h_pad = (h_old // window_size + 1) * window_size - h_old
             w_pad = (w_old // window_size + 1) * window_size - w_old
-            import torch.nn.functional as F
 
+            # Use efficient padding with reflect mode
             img = F.pad(img, (0, w_pad, 0, h_pad), mode="reflect")
 
             output = test(img, model, args, window_size)
@@ -1062,9 +1180,13 @@ def main() -> None:
         else:
             output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))
             output = (output * 255.0).round().astype(np.uint8)
-            cv2.imwrite(
-                str(out_path), output, [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality]
-            )
+            cv2.imwrite(str(out_path), output, [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
+    
+    # Save inference configuration
+    config_path = out_dir / "inference_config.json"
+    with open(config_path, "w") as f:
+        json.dump(args.__dict__, f, indent=2)
+    print(f"Inference configuration saved to: {config_path}")
 
 
 if __name__ == "__main__":
