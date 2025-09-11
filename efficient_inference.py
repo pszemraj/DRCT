@@ -81,33 +81,16 @@ def audit_buffers(model):
 
 
 def _dry_run_compile(model, device, tile, amp_dtype=torch.bfloat16, mode="reduce-overhead"):
-    """Dry run compilation to surface any graph breaks.
-    
-    This intentionally uses fullgraph=True to fail loudly if there are ANY graph breaks.
-    This is expected to fail in most cases - it's a diagnostic tool.
-    """
     x = torch.zeros(1, 3, tile, tile, device=device).contiguous(memory_format=torch.channels_last)
-    
-    # First, list graph breaks for diagnostics
+    # list graph breaks, then force fullgraph capture
     try:
         from torch._dynamo import explain
-
-        log("[Compile] Analyzing model for graph breaks...")
-        explanation = explain(model, x)
-        log(f"[Compile] Graph breaks found: {explanation.graph_break_count}")
-        if explanation.graph_break_count > 0:
-            log("[Compile] Graph breaks detected (this is normal):")
-            for i, gb in enumerate(explanation.break_reasons[:5]):  # Show first 5 breaks
-                log(f"  {i+1}. {gb}")
+        print(explain(model, x))
     except Exception as e:
-        log(f"[Compile] Could not analyze graph breaks: {e}")
-    
-    # Now attempt fullgraph compilation - this will likely fail and that's OK
-    log(f"[Compile] Testing fullgraph compilation with mode={mode}...")
+        print(f"[dynamo.explain] {e}")
     m = torch.compile(model, mode=mode, fullgraph=True, dynamic=False)
     with torch.inference_mode(), torch.autocast("cuda", dtype=amp_dtype):
-        _ = m(x)
-    log("[Compile] Unexpected: Full graph compilation succeeded! Model is fully compilable.")
+        _ = m(x)  # raises if any break remains
 
 
 def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
@@ -1124,50 +1107,29 @@ def main() -> None:
     model = model.to(memory_format=torch.channels_last)
 
     if args.compile != "off":
-        log(f"[Compile] Starting compilation with mode: {args.compile}")
+        print(f"Compiling model with mode: {args.compile}")
         mode = "reduce-overhead" if args.compile == "reduce" else "max-autotune"
-        
         try:
-            # Check for CPU buffers that would break compilation
-            audit_buffers(model)
-            log("[Compile] Buffer audit passed - all buffers on GPU")
-            
-            # Use actual tile size to avoid recompiles
-            tile = int(args.tile) if getattr(args, "tile", None) and args.tile else 256
-            log(f"[Compile] Using tile size: {tile}")
-            
-            # Determine precision for compilation
-            amp_dtype = torch.bfloat16
-            if args.precision == "fp16":
-                amp_dtype = torch.float16
-            elif args.precision == "fp32":
-                amp_dtype = torch.float32
-            
-            # Dry run to detect graph breaks (fullgraph=True to fail loudly on breaks)
-            try:
-                _dry_run_compile(model, device, tile, amp_dtype=amp_dtype, mode=mode)
-            except Exception as e:
-                log(f"[Compile] Dry run with fullgraph=True failed (expected): {e}")
-                log("[Compile] This is normal - proceeding with regular compilation")
-            
-            # Real compile for execution with static shapes for cudagraphs
-            # NOTE: NOT using fullgraph=True here - let it handle breaks gracefully
-            log(f"[Compile] Compiling model with mode={mode}, dynamic=False (NOT fullgraph)")
-            model = torch.compile(model, mode=mode, dynamic=False, fullgraph=False)
-            
-            # Warmup on exact tile size with channels_last and same dtype
+            audit_buffers(model)  # fail early on stray CPU buffers
+
+            # use the actual tile, not 64, to avoid recompiles and mask mismatches
+            tile = int(args.tile) if getattr(args, "tile", None) else 64
+
+            # dry run: fullgraph=True to surface the latest break loudly
+            _dry_run_compile(model, device, tile, amp_dtype=torch.bfloat16, mode=mode)
+
+            # real compile for execution: keep shapes static for cudagraphs
+            model = torch.compile(model, mode=mode, dynamic=False)
+
+            # warmup on exact tile, channels_last, and same AMP dtype
             if args.input and Path(args.input).is_dir() and len(list(Path(args.input).iterdir())) > 1:
-                log("[Compile] Running warmup inference...")
+                print("Running warmup inference...")
                 dummy = torch.zeros(1, 3, tile, tile, device=device).contiguous(memory_format=torch.channels_last)
-                with torch.inference_mode(), torch.autocast("cuda", dtype=amp_dtype):
+                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                     _ = model(dummy)
-                log("[Compile] Warmup complete!")
-            
+
         except Exception as e:
-            log(f"[Compile] Compilation failed: {e}")
-            log("[Compile] Falling back to eager mode")
-            # Reset model to eager mode
-            model = model._orig_mod if hasattr(model, "_orig_mod") else model
+            print(f"Compilation failed: {e}, falling back to eager mode")
 
     window_size = 16
 
