@@ -11,20 +11,94 @@ This module provides optimized inference for DRCT super-resolution models with:
 import argparse
 import glob
 import json
+import logging as pylog
 import math
+import os
+import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 import torch
+import torch._dynamo as dynamo
+import torch._logging as tlog
 import torch.cuda.streams
 import torch.nn as nn
+import torch.nn.functional as F
+from torch._inductor import config as inductor
 from tqdm.auto import tqdm
+
+# Configure logging for better debugging
+os.environ.setdefault("TORCH_LOGS", "+dynamo,graph_breaks,guards,recompiles,inductor,output_code,cudagraphs")
+warnings.simplefilter("default")
+pylog.basicConfig(level=pylog.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+# Make compilation failures visible
+dynamo.config.suppress_errors = False
+dynamo.config.verbose = True
+
+# Enable torch logging if available
+try:
+    tlog.set_logs(
+        dynamo="debug",
+        graph_breaks=True,
+        guards=True,
+        recompiles=True,
+        inductor="debug",
+        cudagraphs=True,
+        output_code=True,
+    )
+except Exception:
+    pass
+
+# Write debug artifacts
+try:
+    inductor.debug = True
+    inductor.print_kernel_source = True
+    inductor.debug_dir = "torch_compile_debug"
+except Exception:
+    pass
 
 #############################################
 #           Model Utility Functions         #
 #############################################
+
+
+def log(msg):
+    """Log message through tqdm to avoid output conflicts."""
+    try:
+        tqdm.write(str(msg))
+    except Exception:
+        print(msg, flush=True)
+
+
+def audit_buffers(model):
+    """Check for CPU buffers that would break compilation."""
+    bad = [(n, b.device, b.dtype) for n, b in model.named_buffers() if not b.is_cuda]
+    if bad:
+        raise RuntimeError(f"CPU buffers found: {bad}")
+
+
+def _dry_run_compile(model, device, tile, amp_dtype=torch.bfloat16, mode="reduce-overhead"):
+    """Dry run compilation to surface any graph breaks."""
+    x = torch.zeros(1, 3, tile, tile, device=device).contiguous(memory_format=torch.channels_last)
+    # List graph breaks
+    try:
+        from torch._dynamo import explain
+
+        log("[Compile] Analyzing model for graph breaks...")
+        explanation = explain(model, x)
+        log(f"[Compile] Explanation: {explanation}")
+    except Exception as e:
+        log(f"[dynamo.explain] {e}")
+    
+    # Force fullgraph capture to fail loudly on breaks
+    log(f"[Compile] Attempting full graph compilation with mode={mode}...")
+    m = torch.compile(model, mode=mode, fullgraph=True, dynamic=False)
+    with torch.inference_mode(), torch.autocast("cuda", dtype=amp_dtype):
+        _ = m(x)
+    log("[Compile] Full graph compilation successful!")
 
 
 def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
@@ -340,16 +414,18 @@ class SwinTransformerBlock(nn.Module):
         )
 
         if self.shift_size > 0:
-            attn_mask = self.calculate_mask(self.input_resolution)
+            # Pre-calculate mask but don't register as buffer yet (will move to device later)
+            attn_mask = None  # Will be created on-demand with correct device
         else:
             attn_mask = None
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def calculate_mask(self, x_size: Tuple[int, int]) -> torch.Tensor:
+    def calculate_mask(self, x_size: Tuple[int, int], device=None) -> torch.Tensor:
         """Calculate attention mask for shifted window attention."""
         H, W = x_size
-        img_mask = torch.zeros((1, H, W, 1))
+        # Create mask on the correct device from the start
+        img_mask = torch.zeros((1, H, W, 1), device=device if device is not None else "cpu")
         h_slices = (
             slice(0, -self.window_size),
             slice(-self.window_size, -self.shift_size),
@@ -388,9 +464,22 @@ class SwinTransformerBlock(nn.Module):
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
         if self.input_resolution == x_size:
-            attn_windows = self.attn(x_windows, mask=self.attn_mask)
+            # Use cached mask if available and on correct device
+            if self.attn_mask is not None:
+                attn_windows = self.attn(x_windows, mask=self.attn_mask)
+            elif self.shift_size > 0:
+                # Create mask on demand with correct device
+                if self.attn_mask is None:
+                    self.attn_mask = self.calculate_mask(self.input_resolution, device=x.device)
+                attn_windows = self.attn(x_windows, mask=self.attn_mask)
+            else:
+                attn_windows = self.attn(x_windows, mask=None)
         else:
-            attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size).to(x.device))
+            # Different size, calculate new mask
+            if self.shift_size > 0:
+                attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size, device=x.device))
+            else:
+                attn_windows = self.attn(x_windows, mask=None)
 
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
         shifted_x = window_reverse(attn_windows, self.window_size, H, W)
@@ -650,9 +739,10 @@ class DRCT(nn.Module):
         self.img_range = img_range
         if in_chans == 3:
             rgb_mean = (0.4488, 0.4371, 0.4040)
-            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
+            # Register as buffer so it moves to device automatically
+            self.register_buffer("mean", torch.Tensor(rgb_mean).view(1, 3, 1, 1))
         else:
-            self.mean = torch.zeros(1, 1, 1, 1)
+            self.register_buffer("mean", torch.zeros(1, 1, 1, 1))
         self.upscale = upscale
         self.upsampler = upsampler
 
@@ -770,7 +860,7 @@ class DRCT(nn.Module):
         Returns:
             Super-resolved image tensor
         """
-        self.mean = self.mean.type_as(x)
+        # No need to move mean as it's now a buffer that moves with the model
         x = (x - self.mean) * self.img_range
 
         if self.upsampler == "pixelshuffle":
@@ -1018,24 +1108,52 @@ def main() -> None:
         resi_connection="1conv",
     )
     checkpoint = torch.load(args.model_path, map_location=device)
-    model.load_state_dict(checkpoint["params"], strict=True)
+    # Load state dict with strict=False to handle missing buffer
+    model.load_state_dict(checkpoint["params"], strict=False)
     model.eval()
     model = model.to(device)
     model = model.to(memory_format=torch.channels_last)
 
     if args.compile != "off":
-        print(f"Compiling model with mode: {args.compile}")
-        backend = "reduce-overhead" if args.compile == "reduce" else "max-autotune"
+        log(f"[Compile] Starting compilation with mode: {args.compile}")
+        mode = "reduce-overhead" if args.compile == "reduce" else "max-autotune"
+        
         try:
-            model = torch.compile(model, mode=backend, dynamic=True)
+            # Check for CPU buffers that would break compilation
+            audit_buffers(model)
+            log("[Compile] Buffer audit passed - all buffers on GPU")
+            
+            # Use actual tile size to avoid recompiles
+            tile = int(args.tile) if getattr(args, "tile", None) and args.tile else 256
+            log(f"[Compile] Using tile size: {tile}")
+            
+            # Determine precision for compilation
+            amp_dtype = torch.bfloat16
+            if args.precision == "fp16":
+                amp_dtype = torch.float16
+            elif args.precision == "fp32":
+                amp_dtype = torch.float32
+            
+            # Dry run to detect graph breaks
+            _dry_run_compile(model, device, tile, amp_dtype=amp_dtype, mode=mode)
+            
+            # Real compile for execution with static shapes for cudagraphs
+            log(f"[Compile] Compiling model with mode={mode}, dynamic=False")
+            model = torch.compile(model, mode=mode, dynamic=False)
+            
+            # Warmup on exact tile size with channels_last and same dtype
             if args.input and Path(args.input).is_dir() and len(list(Path(args.input).iterdir())) > 1:
-                print("Running warmup inference...")
-                dummy_input = torch.randn(1, 3, 64, 64, device=device, dtype=torch.float32)
-                dummy_input = dummy_input.contiguous(memory_format=torch.channels_last)
-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    _ = model(dummy_input)
+                log("[Compile] Running warmup inference...")
+                dummy = torch.zeros(1, 3, tile, tile, device=device).contiguous(memory_format=torch.channels_last)
+                with torch.inference_mode(), torch.autocast("cuda", dtype=amp_dtype):
+                    _ = model(dummy)
+                log("[Compile] Warmup complete!")
+            
         except Exception as e:
-            print(f"Compilation failed: {e}, falling back to eager mode")
+            log(f"[Compile] Compilation failed: {e}")
+            log("[Compile] Falling back to eager mode")
+            # Reset model to eager mode
+            model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
     window_size = 16
 
@@ -1059,7 +1177,6 @@ def main() -> None:
             _, _, h_old, w_old = img.size()
             h_pad = (h_old // window_size + 1) * window_size - h_old
             w_pad = (w_old // window_size + 1) * window_size - w_old
-            import torch.nn.functional as F
 
             # Use efficient padding with reflect mode
             img = F.pad(img, (0, w_pad, 0, h_pad), mode="reflect")
